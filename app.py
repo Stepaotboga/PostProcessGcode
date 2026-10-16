@@ -1,6 +1,8 @@
 import sys
 import os
 import webbrowser
+from unittest.mock import DEFAULT
+
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QPushButton, QVBoxLayout, QHBoxLayout,
     QFileDialog, QMessageBox, QLabel, QCheckBox, QGroupBox, QFormLayout,
@@ -12,6 +14,21 @@ from PyQt5.QtCore import Qt
 from handwritten import process_noise
 from v_offset import modify_z_properties
 
+#default config
+DEFAULT_CONST = {
+    #МИКРО дрожания руки:
+    "tremor_freq": 5.0, # Частота микро дрожи
+    "tremor_amp": 0.03, # Амплитуда микродрожи  (мм)
+
+    # Ступень 2: Уход высоты букв (Низкая частота, большая амплитуда)
+    "height_freq": 0.12, # Частота Ступени 2: Уход высоты букв (Низкая частота, большая амплитуда)
+    "height_amp": 0.28,  # Амплитуда (мм)
+
+    # # Зоны плавного перехода fade (в миллиметрах)
+    "fade_factor_1": 5.2,    # Расстояние полного нарастания для fade1  (мм)
+    "fade_factor_2": 12.1   # Расстояние полного нарастания для fade2  (мм)
+}
+
 
 class GCodeConverterApp(QWidget):
     def __init__(self):
@@ -22,7 +39,7 @@ class GCodeConverterApp(QWidget):
 
     def initUI(self):
         self.setWindowTitle('G-code Конвейер Модификаций')
-        self.resize(750, 600)
+        self.resize(750, 650)
 
         # Главный Layout разделен на Левую панель настроек и Правую панель предпросмотра
         main_layout = QHBoxLayout()
@@ -48,33 +65,57 @@ class GCodeConverterApp(QWidget):
         # Конфигурация параметров (Вкладки)
         self.tabs = QTabWidget()
 
-        # Вкладка настроек ШУМА
+        # --- ОБНОВЛЕННАЯ ВКЛАДКА НАСТРОЕК ДВУХУРОВНЕВОГО ШУМА ---
         tab_noise = QWidget()
         form_noise = QFormLayout()
-        self.sp_max_jitter = QDoubleSpinBox()
-        self.sp_max_jitter.setRange(0.0, 5.0)
-        self.sp_max_jitter.setValue(0.09)
-        self.sp_max_jitter.setSingleStep(0.01)
 
-        self.sp_noise_freq = QDoubleSpinBox()
-        self.sp_noise_freq.setRange(0.0, 10.0)
-        self.sp_noise_freq.setValue(0.3)
-        self.sp_noise_freq.setSingleStep(0.05)
+        # Ступень 1: Дрожание руки (Высокая частота, малая амплитуда)
+        self.sp_tremor_freq = QDoubleSpinBox()
+        self.sp_tremor_freq.setRange(0.1, 20.0)
+        self.sp_tremor_freq.setValue(DEFAULT_CONST.get("tremor_freq", 5.0))
+        self.sp_tremor_freq.setSingleStep(0.5)
 
-        self.chk_smooth_noise = QCheckBox()
-        self.chk_smooth_noise.setChecked(True)
-        self.chk_dir_bias = QCheckBox()
-        self.chk_dir_bias.setChecked(True)
-        self.sp_dir_factor = QDoubleSpinBox()
-        self.sp_dir_factor.setRange(0.0, 5.0)
-        self.sp_dir_factor.setValue(0.06)
-        self.sp_dir_factor.setSingleStep(0.01)
+        self.sp_tremor_amp = QDoubleSpinBox()
+        self.sp_tremor_amp.setRange(0.0, 1.0)
+        self.sp_tremor_amp.setValue(DEFAULT_CONST.get("tremor_amp", 0.03))
+        self.sp_tremor_amp.setSingleStep(0.005)
+        self.sp_tremor_amp.setDecimals(3)
 
-        form_noise.addRow("Использовать плавное дрожание:", self.chk_smooth_noise)
-        form_noise.addRow("Макс. отклонение Jitter (мм):", self.sp_max_jitter)
-        form_noise.addRow("Частота шума (Frequency):", self.sp_noise_freq)
-        form_noise.addRow("Зависимость от направления линии:", self.chk_dir_bias)
-        form_noise.addRow("Сила искажения направления (Factor):", self.sp_dir_factor)
+        # Ступень 2: Уход высоты букв (Низкая частота, большая амплитуда)
+        self.sp_height_freq = QDoubleSpinBox()
+        self.sp_height_freq.setRange(0.01, 5.0)
+        self.sp_height_freq.setValue(DEFAULT_CONST.get("height_freq", 0.12))
+        self.sp_height_freq.setSingleStep(0.02)
+
+        self.sp_height_amp = QDoubleSpinBox()
+        self.sp_height_amp.setRange(0.0, 2.0)
+        self.sp_height_amp.setValue(DEFAULT_CONST.get("height_amp", 0.28))
+        self.sp_height_amp.setSingleStep(0.02)
+
+        # Зоны плавного перехода fade (в миллиметрах)
+        self.sp_fade_factor_1 = QDoubleSpinBox()
+        self.sp_fade_factor_1.setRange(0.1, 50.0)
+        self.sp_fade_factor_1.setValue(DEFAULT_CONST.get("fade_factor_1", 1.5))
+        self.sp_fade_factor_1.setSingleStep(0.5)
+
+        self.sp_fade_factor_2 = QDoubleSpinBox()
+        self.sp_fade_factor_2.setRange(0.1, 50.0)
+        self.sp_fade_factor_2.setValue(DEFAULT_CONST.get("fade_factor_2", 4.0))
+        self.sp_fade_factor_2.setSingleStep(0.5)
+
+        # Добавляем элементы в форму
+        form_noise.addRow(QLabel("<b>Шаг 1: Микро-дрожание руки</b>"))
+        form_noise.addRow("Частота дрожания (Tremor Freq):", self.sp_tremor_freq)
+        form_noise.addRow("Амплитуда дрожания (Tremor Amp, мм):", self.sp_tremor_amp)
+
+        form_noise.addRow(QLabel("<b>Шаг 2: Искажение высоты строк</b>"))
+        form_noise.addRow("Частота волны букв (Height Freq):", self.sp_height_freq)
+        form_noise.addRow("Амплитуда уплывания (Height Amp, мм):", self.sp_height_amp)
+
+        form_noise.addRow(QLabel("<b>Параметры зон затухания (мм)</b>"))
+        form_noise.addRow("Разгон/затухание дрожания (Fade 1):", self.sp_fade_factor_1)
+        form_noise.addRow("Разгон/затухание волны (Fade 2):", self.sp_fade_factor_2)
+
         tab_noise.setLayout(form_noise)
 
         # Вкладка настроек ПАУЗЫ И СМЕЩЕНИЯ
@@ -151,22 +192,24 @@ class GCodeConverterApp(QWidget):
         name_part, ext_part = os.path.splitext(file_name)
         self.output_file = os.path.join(dir_name, f"{name_part}_modified{ext_part}")
 
-        # Шаг 0. Создаем цепочку временных файлов
+        # Создаем цепочку временных файлов
         current_input = self.selected_file
         temp_noise_file = os.path.join(dir_name, "~temp_noise.gcode")
 
         try:
-            # Шаг 1. Обработка ИСКУССТВЕННОГО ШУМА
+            # Шаг 1. Обработка ИСКУССТВЕННОГО ДВУХУРОВНЕВОГО ШУМА
             if self.chk_noise.isChecked():
+                # Передаем конфигурацию, считанную напрямую из элементов графического окна интерфейса
                 noise_config = {
-                    "use_smooth_noise": self.chk_smooth_noise.isChecked(),
-                    "max_jitter": self.sp_max_jitter.value(),
-                    "noise_frequency": self.sp_noise_freq.value(),
-                    "use_directional_bias": self.chk_dir_bias.isChecked(),
-                    "directional_factor": self.sp_dir_factor.value()
+                    "tremor_frequency": self.sp_tremor_freq.value(),
+                    "tremor_amplitude": self.sp_tremor_amp.value(),
+                    "height_frequency": self.sp_height_freq.value(),
+                    "height_amplitude": self.sp_height_amp.value(),
+                    "fade_factor_1": self.sp_fade_factor_1.value(),
+                    "fade_factor_2": self.sp_fade_factor_2.value()
                 }
                 process_noise(current_input, temp_noise_file, noise_config)
-                current_input = temp_noise_file  # передаем измененный файл следующему скрипту
+                current_input = temp_noise_file
 
             # Шаг 2. Обработка СМЕЩЕНИЙ И ПАУЗ
             if self.chk_offset.isChecked():
@@ -181,7 +224,6 @@ class GCodeConverterApp(QWidget):
                     raise Exception(f"Ошибка в блоке z_offset: {res_val}")
                 msg_text = f"Успешно обработано!\nОбщая длина траектории: {res_val:.2f} мм\nСохранено в: {os.path.basename(self.output_file)}"
             else:
-                # Если z_offset отключен, просто переносим результат работы шума (или исходника) в финальный файл
                 if current_input != self.selected_file:
                     os.replace(current_input, self.output_file)
                 else:
@@ -222,17 +264,11 @@ class GCodeConverterApp(QWidget):
         self.preview_text.setPlainText("".join(preview_lines))
 
     def open_in_nc_viewer(self):
-        """Открывает браузер со ссылкой на онлайн-визуализатор NC Viewer."""
         if not self.output_file or not os.path.exists(self.output_file):
             QMessageBox.warning(self, "Ошибка", "Сначала сгенерируйте итоговый файл!")
             return
-
-        # Так как ncviewer.com работает с локальными файлами через ручной Drag-and-Drop пользователя,
-        # мы открываем сам сайт и напоминаем пользователю перетащить созданный файл туда.
-        # Дополнительно открываем папку с созданным файлом для удобства перетаскивания.
         url = "ncviewer.com"
         webbrowser.open(url)
-        # Открываем проводник с выделенным файлом
         output_dir = os.path.dirname(os.path.abspath(self.output_file))
         os.startfile(output_dir)
         QMessageBox.information(
@@ -244,7 +280,7 @@ class GCodeConverterApp(QWidget):
         )
 
 if __name__ == '__main__':
-        app = QApplication(sys.argv)
-        ex = GCodeConverterApp()
-        ex.show()
-        sys.exit(app.exec_())
+    app = QApplication(sys.argv)
+    ex = GCodeConverterApp()
+    ex.show()
+    sys.exit(app.exec_())

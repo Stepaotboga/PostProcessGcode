@@ -4,6 +4,163 @@ import re
 
 num_perlins_noises = 2 #количество ступеней шума перлина
 
+import math
+import re
+
+
+# Быстрая и независимая реализация шума Перлина (без сторонних библиотек)
+class PerlinNoise:
+    def __init__(self):
+        # Таблица перестановок для создания стабильного псевдослучайного поля
+        self.p = [
+            151, 160, 137, 91, 90, 15, 131, 13, 201, 95, 96, 53, 194, 233, 7, 225, 140, 36, 103, 30, 69, 142, 8, 99, 37,
+            240, 21, 10, 23,
+            190, 6, 148, 247, 120, 234, 75, 0, 26, 197, 62, 94, 252, 219, 203, 117, 35, 11, 32, 57, 177, 33, 88, 237,
+            149, 56, 87, 174,
+            20, 125, 136, 171, 168, 68, 175, 74, 165, 71, 134, 139, 48, 27, 166, 77, 146, 158, 231, 83, 111, 229, 122,
+            60, 211, 133,
+            230, 220, 105, 92, 41, 55, 46, 245, 40, 244, 102, 143, 54, 65, 25, 63, 161, 1, 216, 80, 73, 209, 76, 132,
+            187, 208, 89,
+            18, 169, 200, 196, 135, 130, 116, 188, 159, 86, 164, 100, 109, 198, 173, 186, 3, 64, 52, 217, 226, 250, 124,
+            123, 5, 202,
+            38, 147, 118, 126, 255, 82, 85, 212, 207, 206, 59, 227, 47, 16, 58, 17, 182, 189, 28, 42, 223, 183, 170,
+            213, 119, 248, 152,
+            2, 44, 154, 163, 70, 221, 153, 101, 155, 167, 43, 172, 9, 129, 22, 39, 253, 19, 98, 108, 110, 79, 113, 224,
+            232, 178, 185,
+            112, 104, 218, 246, 97, 228, 251, 34, 242, 193, 238, 210, 144, 12, 191, 179, 162, 241, 81, 51, 145, 235,
+            249, 14, 239,
+            107, 49, 192, 214, 31, 181, 199, 106, 157, 184, 84, 204, 176, 115, 121, 50, 45, 127, 4, 150, 254, 138, 236,
+            205, 93, 222,
+            114, 67, 29, 24, 72, 243, 141, 128, 195, 78, 66, 215, 61, 156, 180
+        ]
+        self.p += self.p  # Дублируем массив для защиты от выхода за границы индекса
+
+    def fade(self, t):
+        return t * t * t * (t * (t * 6 - 15) + 10)
+
+    def lerp(self, t, a, b):
+        return a + t * (b - a)
+
+    def grad(self, hash_val, x, y):
+        h = hash_val & 7
+        u = x if h < 4 else y
+        v = y if h < 4 else x
+        return ((u if (h & 1) == 0 else -u) + (v if (h & 2) == 0 else -v))
+
+    def noise2d(self, x, y):
+        X = int(math.floor(x)) & 255
+        Y = int(math.floor(y)) & 255
+        x -= math.floor(x)
+        y -= math.floor(y)
+        u = self.fade(x)
+        v = self.fade(y)
+        A = self.p[X] + Y
+        B = self.p[X + 1] + Y
+        return self.lerp(v, self.lerp(u, self.grad(self.p[A], x, y),
+                                      self.grad(self.p[B], x - 1, y)),
+                         self.lerp(u, self.grad(self.p[A + 1], x, y - 1),
+                                   self.grad(self.p[B + 1], x - 1, y - 1)))
+
+
+# Инициализируем глобальный объект генератора
+perlin = PerlinNoise()
+
+
+def calculate_perlin_shifts(x, y, config, f1_val, f2_val):
+    """
+    Вычисляет результирующий двухкомпонентный сдвиг по осям X и Y.
+    """
+    # Ступень 1: Мелкое дрожание руки (Высокая частота, малая амплитуда)
+    freq_tremor = config.get("tremor_frequency", 4.5)
+    amp_tremor = config.get("tremor_amplitude", 0.04)  # до 0.04 мм
+
+    # Смещаем сетку для Y, чтобы координаты не двигались синхронно по диагонали
+    tremor_x = perlin.noise2d(x * freq_tremor, y * freq_tremor)
+    tremor_y = perlin.noise2d(x * freq_tremor + 50.0, y * freq_tremor + 50.0)
+
+    # Ступень 2: Удержание высоты букв / базовой линии (Низкая частота, большая амплитуда)
+    freq_height = config.get("height_frequency", 0.15)
+    amp_height = config.get("height_amplitude", 0.30)  # до 0.30 мм
+
+    height_x = perlin.noise2d(x * freq_height, y * freq_height)
+    height_y = perlin.noise2d(x * freq_height + 120.0, y * freq_height + 120.0)
+
+    # Итоговый сдвиг — сумма двух октав, умноженная на свои индивидуальные fade-коэффициенты
+    total_shift_x = (tremor_x * amp_tremor * f1_val) + (height_x * amp_height * f2_val)
+    total_shift_y = (tremor_y * amp_tremor * f1_val) + (height_y * amp_height * f2_val)
+
+    return total_shift_x, total_shift_y
+
+
+def apply_perlin_noise_to_segmented_gcode(input_file, output_file, config):
+    """
+    Считывает готовый файл (где траектории уже разбиты на отрезки по 0.25 мм),
+    извлекает значения fade1/fade2 и накладывает двухуровневый шум Перлина на координаты.
+    """
+    x_re = re.compile(r"X\s*([0-9.-]+)", re.IGNORECASE)
+    y_re = re.compile(r"Y\s*([0-9.-]+)", re.IGNORECASE)
+
+    # Паттерны для поиска коэффициентов затухания, сформированных на прошлых шагах
+    fade1_pattern = r'\bfade1=([0-9.]+)'
+    fade2_pattern = r'\bfade2=([0-9.]+)'
+
+    # Координаты отслеживания идеального положения (без шума)
+    curr_x, curr_y = 0.0, 0.0
+
+    with open(input_file, "r", encoding="utf-8") as infile, open(
+            output_file, "w", encoding="utf-8"
+    ) as outfile:
+
+        for line in infile:
+            stripped = line.strip()
+
+            # Обрабатываем только рабочие перемещения плоттера. Холостой ход G0 не трогаем.
+            if stripped.startswith("G1"):
+                x_match = x_re.search(stripped)
+                y_match = y_re.search(stripped)
+
+                # Обновляем наши идеальные опорные координаты
+                target_x = float(x_match.group(1)) if x_match else curr_x
+                target_y = float(y_match.group(1)) if y_match else curr_y
+
+                f1_match = re.search(fade1_pattern, stripped)
+                f2_match = re.search(fade2_pattern, stripped)
+
+                # Если коэффициенты затухания найдены — берем их, иначе считаем равными 0.0
+                f1_val = float(f1_match.group(1)) if f1_match else 0.0
+                f2_val = float(f2_match.group(1)) if f2_match else 0.0
+
+                # Применяем шум, только если хотя бы один коэффициент больше нуля
+                if f1_val > 0 or f2_val > 0:
+                    shift_x, shift_y = calculate_perlin_shifts(target_x, target_y, config, f1_val, f2_val)
+
+                    final_x = round(target_x + shift_x, 3)
+                    final_y = round(target_y + shift_y, 3)
+
+                    # Модифицируем строку G-кода новыми зашумленными координатами
+                    if x_match:
+                        stripped = re.sub(r"X\s*[0-9.-]+", f"X{final_x}", stripped, flags=re.IGNORECASE)
+                    else:
+                        # Если координаты Х не было в команде (изменился только Y), добавляем её принудительно
+                        stripped = re.sub(r"G1", f"G1 X{final_x}", stripped, flags=re.IGNORECASE)
+
+                    if y_match:
+                        stripped = re.sub(r"Y\s*[0-9.-]+", f"Y{final_y}", stripped, flags=re.IGNORECASE)
+                    else:
+                        # Если координаты Y не было в команде, добавляем её принудительно после X
+                        stripped = re.sub(r"(X\s*[0-9.-]+)", r"\1" + f" Y{final_y}", stripped, flags=re.IGNORECASE)
+
+                curr_x, curr_y = target_x, target_y
+
+            # Обновляем координаты на холостых перемещениях G0, чтобы не накапливать ошибку
+            elif stripped.startswith("G0"):
+                x_match = x_re.search(stripped)
+                y_match = y_re.search(stripped)
+                if x_match: curr_x = float(x_match.group(1))
+                if y_match: curr_y = float(y_match.group(1))
+
+            outfile.write(stripped + "\n")
+
 
 def get_grid_offset(x, y, config):
     """
@@ -45,12 +202,18 @@ def apply_directional_bias(dx, dy, config):
 
 
 def process_noise(input_file, output_file, config):
+    # 1. Дробим отрезки
     segment_splitting(input_file, input_file + "_segments.gcode", config)
-    print("segments")
-    calculate_fade_normal(input_file + "_segments.gcode", input_file + "_segments_reversed.gcode", config)
-    print("process_segments")
-    calculate_fade_reverse(input_file + "_segments_reversed.gcode", output_file, config)
-    print("process_segments reversed")
+
+    # 2. Считаем плавный разгон fade
+    calculate_fade_normal(input_file + "_segments.gcode", input_file + "_normal.gcode", config)
+
+    # 3. Считаем плавное затухание fade с конца траекторий
+    calculate_fade_reverse(input_file + "_normal.gcode", input_file + "_faded.gcode", config)
+
+    # 4. Накладываем шум Перлина на базе полученных fade коэффициентов
+    apply_perlin_noise_to_segmented_gcode(input_file + "_faded.gcode", output_file, config)
+    print("Шум Перлина успешно наложен!")
 
 
 def calculate_fade_normal(input_file, output_file, config):
