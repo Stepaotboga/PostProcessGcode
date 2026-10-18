@@ -18,15 +18,21 @@ from v_offset import modify_z_properties
 DEFAULT_CONST = {
     #МИКРО дрожания руки:
     "tremor_freq": 5.0, # Частота микро дрожи
-    "tremor_amp": 0.03, # Амплитуда микродрожи  (мм)
+    "tremor_amp": 0.06, # Амплитуда микродрожи  (мм)
 
     # Ступень 2: Уход высоты букв (Низкая частота, большая амплитуда)
-    "height_freq": 0.12, # Частота Ступени 2: Уход высоты букв (Низкая частота, большая амплитуда)
-    "height_amp": 0.28,  # Амплитуда (мм)
+    "height_freq": 0.09, # Частота Ступени 2: Уход высоты букв (Низкая частота, большая амплитуда)
+    "height_amp": 0.68,  # Амплитуда (мм)
 
     # # Зоны плавного перехода fade (в миллиметрах)
     "fade_factor_1": 5.2,    # Расстояние полного нарастания для fade1  (мм)
-    "fade_factor_2": 12.1   # Расстояние полного нарастания для fade2  (мм)
+    "fade_factor_2": 12.1,   # Расстояние полного нарастания для fade2  (мм)
+
+    # Параметры для z_offset и паузы
+    # Настройки при стирании карандаша
+    "pause_dist": 5000.0,
+    "defa_s": 0.75, # Выдвижение карандаша (S, мм):
+    "defa_l": 0.05 # Стандартный z_offset (l, мм)
 }
 
 
@@ -123,16 +129,16 @@ class GCodeConverterApp(QWidget):
         form_offset = QFormLayout()
         self.sp_l = QDoubleSpinBox()
         self.sp_l.setRange(0.0, 10.0)
-        self.sp_l.setValue(0.05)
+        self.sp_l.setValue(DEFAULT_CONST.get("defa_l", 0.05))
         self.sp_l.setDecimals(3)
 
         self.sp_S = QDoubleSpinBox()
         self.sp_S.setRange(0.0, 10.0)
-        self.sp_S.setValue(0.75)
+        self.sp_S.setValue(DEFAULT_CONST.get("defa_s", 0.75))
 
         self.sp_pause_dist = QDoubleSpinBox()
         self.sp_pause_dist.setRange(100.0, 100000.0)
-        self.sp_pause_dist.setValue(6000.0)
+        self.sp_pause_dist.setValue(DEFAULT_CONST.get("pause_dist", 6000.0))
         self.sp_pause_dist.setSingleStep(500.0)
 
         form_offset.addRow("Стандартный z_offset (l, мм):", self.sp_l)

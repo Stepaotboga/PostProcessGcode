@@ -162,44 +162,6 @@ def apply_perlin_noise_to_segmented_gcode(input_file, output_file, config):
             outfile.write(stripped + "\n")
 
 
-def get_grid_offset(x, y, config):
-    """
-    Генерирует детерминированный сдвиг (Z, W) на базе 4D-карты.
-    Входные оси — глобальные координаты X и Y, а результат — сдвиг по X и Y.
-    Благодаря привязке к сетке координат, соседние проходы толстых линий
-    будут смещаться в одну и ту же сторону, сохраняя геометрию.
-    """
-    freq = config.get("noise_frequency", 0.3)
-    max_jitter = config.get("max_jitter", 0.09)
-
-    # Матрица синусоид формирует стабильное непрерывное векторное поле сдвигов
-    noise_z = (0.5 * math.sin(freq * x) +
-               0.3 * math.sin(freq * y + 1.2) +
-               0.2 * math.sin(freq * (x + y) * 0.7))
-
-    noise_w = (0.5 * math.sin(freq * y + 5.5) +
-               0.3 * math.sin(freq * x + 3.1) +
-               0.2 * math.sin(freq * (x - y) * 1.1))
-
-    return noise_z * max_jitter, noise_w * max_jitter
-
-def apply_directional_bias(dx, dy, config):
-    """Добавляет искажение в зависимости от направления движения."""
-    if not config.get("use_directional_bias", False):
-        return 0.0, 0.0
-    if dx == 0 and dy == 0:
-        return 0.0, 0.0
-
-    angle = math.atan2(dy, dx)
-    bias_factor = math.sin(angle) ** 2
-    seed_noise = math.sin(angle * 10) * 0.5
-
-    dir_factor = config.get("directional_factor", 0.06)
-    shift_x = seed_noise * dir_factor * bias_factor
-    shift_y = seed_noise * dir_factor * bias_factor * 1.3
-    return shift_x, shift_y
-
-
 
 def process_noise(input_file, output_file, config):
     # 1. Дробим отрезки
@@ -269,7 +231,7 @@ def calculate_fade_normal(input_file, output_file, config):
                         curr_f1 = min(curr_f1 + linear_step_1, 1.0)
 
                     stripped = re.subn(fade1_remove_pattern, ' ', stripped)[0]
-                    stripped += f"; fade1={round(curr_f1, 3)}"
+                    stripped += f" fade1={round(curr_f1, 3)} "
 
                 if f2_match:
                     fade2_target_mode = float(f2_match.group(1))
@@ -281,7 +243,7 @@ def calculate_fade_normal(input_file, output_file, config):
                         curr_f2 = min(curr_f2 + linear_step_2, 1.0)
 
                     stripped = re.subn(fade2_remove_pattern, ' ', stripped)[0]
-                    stripped += f"; fade2={round(curr_f2, 3)} "
+                    stripped += f" fade2={round(curr_f2, 3)} "
 
                 curr_x, curr_y, curr_z = target_x, target_y, target_z
 
@@ -359,7 +321,7 @@ def calculate_fade_reverse(input_file, output_file, config):
                 final_f1 = min(normal_f1, curr_rf1)
 
                 stripped = re.sub(fade1_remove_pattern, ' ', stripped)
-                stripped += f"; fade1={round(final_f1, 3)}"
+                stripped += f" fade1={round(final_f1, 3)} "
 
             if f2_match:
                 normal_f2 = float(f2_match.group(1))
@@ -373,7 +335,7 @@ def calculate_fade_reverse(input_file, output_file, config):
                 final_f2 = min(normal_f2, curr_rf2)
 
                 stripped = re.sub(fade2_remove_pattern, ' ', stripped)
-                stripped += f"; fade2={round(final_f2, 3)}"
+                stripped += f" fade2={round(final_f2, 3)} "
 
         out_file_data.append(stripped)
 
@@ -385,135 +347,142 @@ def calculate_fade_reverse(input_file, output_file, config):
 
 def segment_splitting(input_file, output_file, config):
     """
-    Разбивает малые участки (< 10мм) на сегменты по 0.25мм,
-    применяет к ним 4D карту смещений и сглаживает переходы на границах с длинными линиями.
+    Разбивает малые участки на сегменты по 0.25мм и сглаживает диагональные
+    3D-подъемы (дорезку углов Aspire) по всем осям XYZ одновременно.
+    Анализирует траекторию скользящим окном в 3 строки.
     """
+    max_segment_length = 4.6
+    conf_step_size = 0.25
+
     x_re = re.compile(r"X\s*([0-9.-]+)", re.IGNORECASE)
     y_re = re.compile(r"Y\s*([0-9.-]+)", re.IGNORECASE)
     z_re = re.compile(r"Z\s*([0-9.-]+)", re.IGNORECASE)
 
-    curr_x, curr_y, curr_z = 0.0, 0.0, 0.0
+    # 1. Считываем весь файл в буфер строк
+    with open(input_file, "r", encoding="utf-8") as infile:
+        lines = infile.readlines()
 
-    # Флаг, указывающий, была ли предыдущая линия длинной (>= 10мм)
+    # Собираем точную сквозную историю координат плоттера для каждой строки
+    coords = []
+    cx, cy, cz = 0.0, 0.0, 0.0
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("G1") or stripped.startswith("G0"):
+            x_m = x_re.search(stripped)
+            y_m = y_re.search(stripped)
+            z_m = z_re.search(stripped)
+            if x_m: cx = float(x_m.group(1))
+            if y_m: cy = float(y_m.group(1))
+            if z_m: cz = float(z_m.group(1))
+        coords.append((cx, cy, cz))
+
+    out_lines = []
     prev_was_long = True
+    l_lines = len(lines)
 
-    with open(input_file, "r", encoding="utf-8") as infile, open(
-            output_file, "w", encoding="utf-8"
-    ) as outfile:
+    # 2. Итерируемся по строкам с анализом трехточечного окна
+    for i in range(l_lines):
+        line = lines[i]
+        stripped = line.strip()
 
-        for line in infile:
-            stripped = line.strip()
+        if stripped.startswith("G1") and i > 0 and i < l_lines - 1:
+            x_match = x_re.search(stripped)
+            y_match = y_re.search(stripped)
+            z_match = z_re.search(stripped)
 
-            if stripped.startswith("G1"):
-                x_match = x_re.search(stripped)
-                y_match = y_re.search(stripped)
-                z_match = z_re.search(stripped)
+            if x_match or y_match:
+                # Точки окна: Предыдущая (A), Текущая (B), Следующая (C)
+                ax, ay, az = coords[i - 1]
+                bx, by, bz = coords[i]
+                cx, cy, cz = coords[i + 1]
 
-                if x_match or y_match:
-                    target_x = float(x_match.group(1)) if x_match else curr_x
-                    target_y = float(y_match.group(1)) if y_match else curr_y
-                    target_z = float(z_match.group(1)) if z_match else curr_z
+                # Векторы: AB (текущее движение) и BC (следующее движение)
+                v1 = (bx - ax, by - ay, bz - az)
+                v2 = (cx - bx, cy - by, cz - bz)
 
-                    dx = target_x - curr_x
-                    dy = target_y - curr_y
-                    dz = target_z - curr_z
-                    segment_length = math.hypot(dx, dy, dz)
+                len_v1 = math.hypot(*v1)
+                len_v2 = math.hypot(*v2)
 
-                    # --- Вариант 1: Большое перемещение (>= 10 мм) ---
-                    if segment_length >= 4.6 or segment_length == 0:
-                        curr_x, curr_y, curr_z = target_x, target_y, target_z
-                        prev_was_long = True
-                        outfile.write(stripped + "; fade1=0 fade2=0" + "\n")
-                        continue
-
-                    # --- Вариант 2: Малое перемещение (< 10 мм) ---
-                    step_size = 0.25
-                    num_steps = max(1, math.ceil(segment_length / step_size))
-
-                    sub_dx = dx / num_steps
-                    sub_dy = dy / num_steps
-                    sub_dz = dz / num_steps
-
-                    # Проверяем, будет ли СЛЕДУЮЩАЯ линия длинной (смотрим наперед здесь нельзя,
-                    # но мы можем плавно гасить шум к концу текущего отрезка, если бы знали.
-                    # Для компенсации входа/выхода считаем расстояние до точек смены режима)
-
-                    for step in range(1, num_steps + 1):
-                        next_x = curr_x + sub_dx
-                        next_y = curr_y + sub_dy
-                        next_z = curr_z + sub_dz
-
-                        # 1. Генерируем чистый сдвиг из глобальной 4D карты
-                        '''total_shift_x, total_shift_y = 0.0, 0.0
-                        if config.get("use_smooth_noise", True):
-                            sx, sy = get_grid_offset(next_x, next_y, config)
-                            total_shift_x += sx
-                            total_shift_y += sy
-
-                        # 2. Добавляем влияние направления линии
-                        bx, by = apply_directional_bias(sub_dx, sub_dy, config)
-                        total_shift_x += bx
-                        total_shift_y += by
-
-                        # 3. Рассчитываем плавный переход (blend_factor)
-                        # Затухание на старте после длинной линии
-                        dist_from_start = math.hypot(next_x - last_boundary_x, next_y - last_boundary_y)
-
-                        # Затухание в конце перед приходом в финишную точку (если мы знаем, что выходим к длинной траектории)
-                        # Так как мы уже внутри короткого сегмента, считаем расстояние до конца текущего малого отрезка
-                        dist_to_end = math.hypot(target_x - next_x, target_y - next_y)
-
-                        blend_factor = 1.0
-
-                        # Если старт был от длинной линии — плавно разгоняем шум
-                        if prev_was_long and dist_from_start < blend_zone:
-                            blend_factor = min(blend_factor, dist_from_start / blend_zone)
-
-                        # Коэффициент не может быть меньше 0
-                        blend_factor = max(0.0, blend_factor)'''
-
-                        # Применяем сглаженный сдвиг
-                        final_x = round(next_x, 3)
-                        final_y = round(next_y, 3)
-                        final_z = round(next_z, 3)
-
-                        # Обновляем текущие идеальные координаты
-                        curr_x, curr_y, curr_z = next_x, next_y, next_z
-
-                        # Собираем строку G-кода обратно
-                        new_line = stripped
-                        if x_match:
-                            new_line = re.sub(r"X\s*[0-9.-]+", f"X{final_x}", new_line, flags=re.IGNORECASE)
-                        if y_match:
-                            new_line = re.sub(r"Y\s*[0-9.-]+", f"Y{final_y}", new_line, flags=re.IGNORECASE)
-                        if z_match:
-                            new_line = re.sub(r"Z\s*[0-9.-]+", f"Z{final_z}", new_line, flags=re.IGNORECASE)
-
-                        # Если в исходной строке был только один компонент, добавляем второй,
-                        # так как шум смещает инструмент в обе стороны одновременно
-                        if x_match and not y_match:
-                            new_line += f" Y{final_y}"
-                        elif y_match and not x_match:
-                            new_line += f" X{final_x}"
-
-                        outfile.write(new_line + "; fade1=1 fade2=1" + "\n")
-
-                    # После завершения цикла малых шагов фиксируем, что режим длинной линии отключен
-                    prev_was_long = False
+                # --- Вариант 1: Большое перемещение (не вмешиваемся в геометрию) ---
+                if len_v1 >= max_segment_length or len_v1 == 0:
+                    prev_was_long = True
+                    out_lines.append(stripped + "; fade1=0 fade2=0")
                     continue
 
-            # Корректно отслеживаем координаты при холостом ходе G0
-            if stripped.startswith("G0"):
-                x_match = x_re.search(stripped)
-                y_match = y_re.search(stripped)
-                if x_match:
-                    curr_x = float(x_match.group(1))
-                if y_match:
-                    curr_y = float(y_match.group(1))
+                # --- Вариант 2: Малое перемещение (Проверяем угол сопряжения) ---
+                smooth_modifier = 1.0
 
-                if prev_was_long:
-                    stripped += "; fade1=0 fade2=0"
-                else:
-                    stripped += "; fade1=1 fade2=1"
+                if len_v1 > 0.001 and len_v2 > 0.001:
+                    # Скалярное произведение 3D векторов
+                    dot_product = v1[0] * v2[0] + v1[1] * v2[1] + v1[2] * v2[2]
+                    cos_angle = max(-1.0, min(1.0, dot_product / (len_v1 * len_v2)))
+                    angle_deg = math.degrees(math.acos(cos_angle))
 
-            outfile.write(stripped + "\n")
+                    # Если угол изменения направления > 45 градусов,
+                    # гасим уход фрезы по диагонали (XYZ) пропорционально остроте угла.
+                    if angle_deg > 45.0:
+                        # Чем ближе угол к 180 (полный разворот назад), тем ближе множитель к 0.1
+                        smooth_modifier = max(0.1, (180.0 - angle_deg) / 135.0)
+
+                # Дробим текущую траекторию на шаги по 0.25 мм
+                step_size = conf_step_size
+                num_steps = max(1, math.ceil(len_v1 / step_size))
+
+                # Рассчитываем базовое приращение на микро-шаг
+                sub_dx = v1[0] / num_steps
+                sub_dy = v1[1] / num_steps
+                sub_dz = v1[2] / num_steps
+
+                for step in range(1, num_steps + 1):
+                    # Если мы дошли до конечной точки сегмента (вершины угла дорезки),
+                    # применяем сглаживающий множитель ко ВСЕМ осям XYZ
+                    if step == num_steps:
+                        next_x = ax + (sub_dx * step) * smooth_modifier
+                        next_y = ay + (sub_dy * step) * smooth_modifier
+                        next_z = az + (sub_dz * step) * smooth_modifier
+
+                        # Корректируем историю координат для следующей итерации окна,
+                        # чтобы плоттер не прыгал из измененной точки обратно на старую траекторию
+                        coords[i] = (next_x, next_y, next_z)
+                    else:
+                        next_x = ax + sub_dx * step
+                        next_y = ay + sub_dy * step
+                        next_z = az + sub_dz * step
+
+                    final_x = round(next_x, 3)
+                    final_y = round(next_y, 3)
+                    final_z = round(next_z, 3)
+
+                    # Формируем строку обратно
+                    new_line = stripped
+                    if x_match:
+                        new_line = re.sub(r"X\s*[0-9.-]+", f"X{final_x}", new_line, flags=re.IGNORECASE)
+                    if y_match:
+                        new_line = re.sub(r"Y\s*[0-9.-]+", f"Y{final_y}", new_line, flags=re.IGNORECASE)
+                    if z_match:
+                        new_line = re.sub(r"Z\s*[0-9.-]+", f"Z{final_z}", new_line, flags=re.IGNORECASE)
+
+                    # Защита от потери осей в кадрах инкрементальных изменений
+                    if x_match and not y_match:
+                        new_line += f" Y{final_y}"
+                    elif y_match and not x_match:
+                        new_line += f" X{final_x}"
+
+                    out_lines.append(new_line + "; fade1=1 fade2=1")
+
+                prev_was_long = False
+                continue
+
+        # Не забываем про отслеживание пустых команд холостого хода G0
+        if stripped.startswith("G0"):
+            if prev_was_long:
+                stripped += "; fade1=0 fade2=0"
+            else:
+                stripped += "; fade1=1 fade2=1"
+
+        out_lines.append(stripped)
+
+    # 3. Перезаписываем выходной файл
+    with open(output_file, "w", encoding="utf-8") as outfile:
+        for out_line in out_lines:
+            outfile.write(out_line + "\n")
