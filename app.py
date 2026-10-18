@@ -1,14 +1,17 @@
 import sys
 import os
+import re
 import webbrowser
-from unittest.mock import DEFAULT
+import numpy as np
 
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QPushButton, QVBoxLayout, QHBoxLayout,
     QFileDialog, QMessageBox, QLabel, QCheckBox, QGroupBox, QFormLayout,
-    QDoubleSpinBox, QTextEdit, QTabWidget
+    QDoubleSpinBox, QTextEdit, QTabWidget, QSlider
 )
 from PyQt5.QtCore import Qt
+from PyQt5.QtGui import QVector3D
+import pyqtgraph.opengl as gl
 
 # Импортируем обновленные модули
 from handwritten import process_noise
@@ -41,13 +44,21 @@ class GCodeConverterApp(QWidget):
         super().__init__()
         self.selected_file = ""
         self.output_file = ""
+
+        # Переменные для хранения данных 3D графики
+        self.work_points = np.empty((0, 3), dtype=np.float32)
+        self.retract_points = np.empty((0, 3), dtype=np.float32)
+        self.work_plot = None
+        self.retract_plot = None
+        self.show_retracts = True
+
         self.initUI()
 
     def initUI(self):
-        self.setWindowTitle('G-code Конвейер Модификаций')
-        self.resize(750, 650)
+        self.setWindowTitle('G-code Конвейер Модификаций с 3D Предпросмотром')
+        # Увеличили размер окна под новые графические компоненты
+        self.resize(1150, 850)
 
-        # Главный Layout разделен на Левую панель настроек и Правую панель предпросмотра
         main_layout = QHBoxLayout()
         left_panel = QVBoxLayout()
         right_panel = QVBoxLayout()
@@ -57,7 +68,6 @@ class GCodeConverterApp(QWidget):
         self.btn_open = QPushButton('Выбрать G-code файл', self)
         self.btn_open.clicked.connect(self.open_file)
 
-        # Чекбоксы модулей обработки
         self.group_modules = QGroupBox("Выбор обработок (выполняются сверху вниз):")
         mod_layout = QVBoxLayout()
         self.chk_noise = QCheckBox("1. Искусственный шум (Реалистичный почерк)")
@@ -68,14 +78,12 @@ class GCodeConverterApp(QWidget):
         mod_layout.addWidget(self.chk_offset)
         self.group_modules.setLayout(mod_layout)
 
-        # Конфигурация параметров (Вкладки)
         self.tabs = QTabWidget()
 
-        # --- ОБНОВЛЕННАЯ ВКЛАДКА НАСТРОЕК ДВУХУРОВНЕВОГО ШУМА ---
+        # ВКЛАДКА НАСТРОЕК ДВУХУРОВНЕВОГО ШУМА
         tab_noise = QWidget()
         form_noise = QFormLayout()
 
-        # Ступень 1: Дрожание руки (Высокая частота, малая амплитуда)
         self.sp_tremor_freq = QDoubleSpinBox()
         self.sp_tremor_freq.setRange(0.1, 20.0)
         self.sp_tremor_freq.setValue(DEFAULT_CONST.get("tremor_freq", 5.0))
@@ -87,7 +95,6 @@ class GCodeConverterApp(QWidget):
         self.sp_tremor_amp.setSingleStep(0.005)
         self.sp_tremor_amp.setDecimals(3)
 
-        # Ступень 2: Уход высоты букв (Низкая частота, большая амплитуда)
         self.sp_height_freq = QDoubleSpinBox()
         self.sp_height_freq.setRange(0.01, 5.0)
         self.sp_height_freq.setValue(DEFAULT_CONST.get("height_freq", 0.12))
@@ -98,7 +105,6 @@ class GCodeConverterApp(QWidget):
         self.sp_height_amp.setValue(DEFAULT_CONST.get("height_amp", 0.28))
         self.sp_height_amp.setSingleStep(0.02)
 
-        # Зоны плавного перехода fade (в миллиметрах)
         self.sp_fade_factor_1 = QDoubleSpinBox()
         self.sp_fade_factor_1.setRange(0.1, 50.0)
         self.sp_fade_factor_1.setValue(DEFAULT_CONST.get("fade_factor_1", 1.5))
@@ -109,15 +115,12 @@ class GCodeConverterApp(QWidget):
         self.sp_fade_factor_2.setValue(DEFAULT_CONST.get("fade_factor_2", 4.0))
         self.sp_fade_factor_2.setSingleStep(0.5)
 
-        # Добавляем элементы в форму
         form_noise.addRow(QLabel("<b>Шаг 1: Микро-дрожание руки</b>"))
         form_noise.addRow("Частота дрожания (Tremor Freq):", self.sp_tremor_freq)
         form_noise.addRow("Амплитуда дрожания (Tremor Amp, мм):", self.sp_tremor_amp)
-
         form_noise.addRow(QLabel("<b>Шаг 2: Искажение высоты строк</b>"))
         form_noise.addRow("Частота волны букв (Height Freq):", self.sp_height_freq)
         form_noise.addRow("Амплитуда уплывания (Height Amp, мм):", self.sp_height_amp)
-
         form_noise.addRow(QLabel("<b>Параметры зон затухания (мм)</b>"))
         form_noise.addRow("Разгон/затухание дрожания (Fade 1):", self.sp_fade_factor_1)
         form_noise.addRow("Разгон/затухание волны (Fade 2):", self.sp_fade_factor_2)
@@ -149,7 +152,6 @@ class GCodeConverterApp(QWidget):
         self.tabs.addTab(tab_noise, "Параметры шума")
         self.tabs.addTab(tab_offset, "Параметры смещения")
 
-        # Кнопка запуска
         self.btn_start = QPushButton('Запустить конвейер преобразования', self)
         self.btn_start.setStyleSheet("background-color: #2baf2b; color: white; font-weight: bold; height: 35px;")
         self.btn_start.setEnabled(False)
@@ -161,21 +163,50 @@ class GCodeConverterApp(QWidget):
         left_panel.addWidget(self.tabs)
         left_panel.addWidget(self.btn_start)
 
-        # --- ПРАВАЯ ПАНЕЛЬ: Предпросмотр G-Code ---
+        # --- ПРАВАЯ ПАНЕЛЬ: Текст + 3D Визуализатор ---
         right_panel.addWidget(QLabel('<b>Предпросмотр итогового G-кода:</b>'))
         self.preview_text = QTextEdit()
         self.preview_text.setReadOnly(True)
+        self.preview_text.setMaximumHeight(180)  # Ограничим по высоте, чтобы осталось место под 3D
         self.preview_text.setPlaceholderText("Здесь отобразится готовый код после обработки...")
         right_panel.addWidget(self.preview_text)
 
-        # Кнопка отправки в NC Viewer
+        # Интерфейс управления 3D интерактивным просмотром
+        right_panel.addWidget(QLabel('<b>Интерактивный 3D Предпросмотр траектории плоттера:</b>'))
+
+        # Виджет 3D графики OpenGL
+        self.gl_view = gl.GLViewWidget()
+        self.gl_view.opts['distance'] = 120
+        grid = gl.GLGridItem()
+        grid.setSize(x=300, y=300, z=0)
+        grid.setSpacing(x=10, y=10, z=0)
+        self.gl_view.addItem(grid)
+        right_panel.addWidget(self.gl_view, stretch=1)
+
+        # Панель управления 3D слоями и холостыми ходами
+        view_ctrl_layout = QHBoxLayout()
+
+        self.btn_toggle_retracts = QPushButton("Скрыть холостые ходы")
+        self.btn_toggle_retracts.setCheckable(True)
+        self.btn_toggle_retracts.clicked.connect(self.toggle_retracts_visibility)
+        view_ctrl_layout.addWidget(self.btn_toggle_retracts)
+
+        view_ctrl_layout.addWidget(QLabel("Послойная анимация:"))
+        self.slider_layers = QSlider(Qt.Horizontal)
+        self.slider_layers.setRange(0, 100)
+        self.slider_layers.setValue(100)
+        self.slider_layers.setEnabled(False)
+        self.slider_layers.valueChanged.connect(self.update_layer_animation)
+        view_ctrl_layout.addWidget(self.slider_layers)
+
+        right_panel.addLayout(view_ctrl_layout)
+
         self.btn_nc_viewer = QPushButton('Визуализировать через движок NC Viewer')
         self.btn_nc_viewer.setStyleSheet("background-color: #0078d7; color: white;")
         self.btn_nc_viewer.setEnabled(False)
         self.btn_nc_viewer.clicked.connect(self.open_in_nc_viewer)
         right_panel.addWidget(self.btn_nc_viewer)
 
-        # Сборка интерфейса
         main_layout.addLayout(left_panel, stretch=2)
         main_layout.addLayout(right_panel, stretch=3)
         self.setLayout(main_layout)
@@ -246,6 +277,7 @@ class GCodeConverterApp(QWidget):
 
             # Шаг 3. Загрузка в текстовое окно предпросмотра
             self.load_preview()
+            self.parse_and_build_3d()  # Генерация 3D сцены
             self.btn_nc_viewer.setEnabled(True)
 
         except Exception as e:
@@ -254,7 +286,6 @@ class GCodeConverterApp(QWidget):
                 os.remove(temp_noise_file)
 
     def load_preview(self):
-        """Загружает первые 500 строк сгенерированного файла, чтобы интерфейс не зависал на больших файлах."""
         if not os.path.exists(self.output_file):
             return
 
@@ -266,12 +297,105 @@ class GCodeConverterApp(QWidget):
                 else:
                     preview_lines.append("\n... [Код обрезан для экономии памяти предпросмотра] ...")
                     break
-
         self.preview_text.setPlainText("".join(preview_lines))
+
+    def parse_and_build_3d(self):
+        """Парсинг результирующего g-кода, разделение G0/G1 и заполнение массивов графики."""
+        if not os.path.exists(self.output_file):
+            return
+
+        work_lst = []
+        retract_lst = []
+        curr_x, curr_y, curr_z = 0.0, 0.0, 0.0
+
+        x_re = re.compile(r'X([-+]?[0-9]*\.?[0-9]+)')
+        y_re = re.compile(r'Y([-+]?[0-9]*\.?[0-9]+)')
+        z_re = re.compile(r'Z([-+]?[0-9]*\.?[0-9]+)')
+
+        with open(self.output_file, 'r', encoding='utf-8', errors='ignore') as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith(';'):
+                    continue
+
+                if line.startswith('G0') or line.startswith('G1'):
+                    is_g0 = line.startswith('G0')
+
+                    match_x = x_re.search(line)
+                    match_y = y_re.search(line)
+                    match_z = z_re.search(line)
+
+                    if match_x: curr_x = float(match_x.group(1))
+                    if match_y: curr_y = float(match_y.group(1))
+                    if match_z: curr_z = float(match_z.group(1))
+
+                    if is_g0 or curr_z > 1.0:
+                        retract_lst.append([curr_x, curr_y, curr_z])
+                        retract_lst.append([np.nan, np.nan, np.nan])
+                    else:
+                        work_lst.append([curr_x, curr_y, curr_z])
+
+        # Очищаем старые объекты со сцены
+        if self.work_plot:
+            self.gl_view.removeItem(self.work_plot)
+        if self.retract_plot:
+            self.gl_view.removeItem(self.retract_plot)
+
+        self.work_points = np.array(work_lst, dtype=np.float32)
+        self.retract_points = np.array(retract_lst, dtype=np.float32)
+
+        # Создание рабочей траектории (Бирюзовый цвет)
+        if len(self.work_points) > 0:
+            work_colors = np.array([0.0, 0.8, 1.0, 0.9], dtype=np.float32)
+            self.work_plot = gl.GLLinePlotItem(pos=self.work_points, color=work_colors, width=1.5, mode='line_strip')
+            self.gl_view.addItem(self.work_plot)
+
+            # ИСПРАВЛЕНО: Центрирование камеры с использованием QVector3D
+            center = self.work_points.mean(axis=0)
+            self.gl_view.setCameraPosition(pos=QVector3D(float(center[0]), float(center[1]), float(center[2])))
+
+        # Создание холостых ходов (Блекло-красный цвет)
+        if len(self.retract_points) > 0:
+            retract_colors = np.array([1.0, 0.2, 0.2, 0.3], dtype=np.float32)
+            self.retract_plot = gl.GLLinePlotItem(pos=self.retract_points, color=retract_colors, width=1.0,
+                                                  mode='lines')
+            if self.show_retracts:
+                self.gl_view.addItem(self.retract_plot)
+
+        if len(self.work_points) > 0:
+            self.slider_layers.setEnabled(True)
+            self.slider_layers.setValue(100)
+
+    def toggle_retracts_visibility(self):
+        """Прячет или показывает холостые траектории по клику на кнопку."""
+        if self.btn_toggle_retracts.isChecked():
+            self.btn_toggle_retracts.setText("Показать холостые ходы")
+            self.show_retracts = False
+            if self.retract_plot in self.gl_view.items:
+                self.gl_view.removeItem(self.retract_plot)
+        else:
+            self.btn_toggle_retracts.setText("Скрыть холостые ходы")
+            self.show_retracts = True
+            if self.retract_plot and self.retract_plot not in self.gl_view.items:
+                self.gl_view.addItem(self.retract_plot)
+
+    def update_layer_animation(self, value):
+        """Отрезает отрисовку рабочей траектории в зависимости от положения ползунка слайдера."""
+        if self.work_plot is None or len(self.work_points) == 0:
+            return
+
+        limit_idx = int((value / 100.0) * len(self.work_points))
+        if limit_idx < 2:
+            current_visible_points = np.empty((0, 3), dtype=np.float32)
+        else:
+            current_visible_points = self.work_points[:limit_idx]
+
+        self.work_plot.setData(pos=current_visible_points)
 
     def open_in_nc_viewer(self):
         if not self.output_file or not os.path.exists(self.output_file):
             QMessageBox.warning(self, "Ошибка", "Сначала сгенерируйте итоговый файл!")
+
             return
         url = "ncviewer.com"
         webbrowser.open(url)
