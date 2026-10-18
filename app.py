@@ -16,39 +16,14 @@ import pyqtgraph as pg
 # Импортируем собственные модули
 from handwritten import process_noise
 from v_offset import modify_z_properties
+from settings import load_section, save_section
 
 
-"""qwertyuiop[]asdfghjkl;'zxcvbnm,./"""
+"""---- ---- ---- ---- Main code ---- ---- ---- ----"""
 
-
-PEN_WIDTH_MM = 0.45            # толщина карандаша для отображения
-
-BED_X, BED_Y = 400.0, 435.0   # рабочая область, мм
-PEN_DOWN_Z = 1.0              # Z ниже этого значения = карандаш на бумаге
 
 AXIS_RE = re.compile(r'([XYZ])\s*([-+]?\d*\.?\d+)', re.IGNORECASE)
 CMD_RE = re.compile(r'^G(0|1|90|91)(?!\d)', re.IGNORECASE)
-
-#default config
-DEFAULT_CONST = {
-    #МИКРО дрожания руки:
-    "tremor_freq": 1.14, # Частота микро дрожи
-    "tremor_amp": 0.18, # Амплитуда микродрожи  (мм)
-
-    # Ступень 2: Уход высоты букв (Низкая частота, большая амплитуда)
-    "height_freq": 0.09, # Частота Ступени 2: Уход высоты букв (Низкая частота, большая амплитуда)
-    "height_amp": 0.41,  # Амплитуда (мм)
-
-    # # Зоны плавного перехода fade (в миллиметрах)
-    "fade_factor_1": 5.2,    # Расстояние полного нарастания для fade1  (мм)
-    "fade_factor_2": 12.1,   # Расстояние полного нарастания для fade2  (мм)
-
-    # Параметры для z_offset и паузы
-    # Настройки при стирании карандаша
-    "pause_dist": 5000.0,
-    "defa_s": 0.75, # Выдвижение карандаша (S, мм):
-    "defa_l": 0.05 # Стандартный z_offset (l, мм)
-}
 
 
 # Упрощение отрисовки предпросмотра gcode
@@ -95,7 +70,7 @@ def simplify_nan_polyline(arr, eps=0.03):
         out.append(np.array([[np.nan, np.nan]]))
     return np.vstack(out[:-1]) if out else arr
 
-def parse_gcode_xy(path, eps=0.03):
+def parse_gcode_xy(path, eps=0.03, pen_down_z=1.0):
     """Парсит G-code в две NaN-разделённые полилинии (XY). Виджетов не трогает."""
     nan = (float('nan'), float('nan'))
     work, travel = [], []
@@ -134,7 +109,7 @@ def parse_gcode_xy(path, eps=0.03):
                 nx, ny, nz = x + ax.get('X', 0), y + ax.get('Y', 0), z + ax.get('Z', 0)
 
             if (nx, ny) != (x, y):
-                if cmd == '1' and nz < PEN_DOWN_Z:
+                if cmd == '1' and nz < pen_down_z:
                     add('work', work, (x, y), (nx, ny))
                 else:
                     add('travel', travel, (x, y), (nx, ny))
@@ -245,13 +220,13 @@ class PreviewWorker(QThread):
     ready = pyqtSignal(object, object, str)   # work_xy, travel_xy, текст
     failed = pyqtSignal(str)
 
-    def __init__(self, path, parent=None):
+    def __init__(self, path, eps, pen_down_z, parent=None):
         super().__init__(parent)
-        self.path = path
+        self.path, self.eps, self.pen_down_z = path, eps, pen_down_z
 
     def run(self):
         try:
-            work_xy, travel_xy = parse_gcode_xy(self.path)
+            work_xy, travel_xy = parse_gcode_xy(self.path, self.eps, self.pen_down_z)
             self.ready.emit(work_xy, travel_xy, read_preview_text(self.path))
         except Exception as e:
             self.failed.emit(str(e))
@@ -271,6 +246,9 @@ class GCodeConverterApp(QWidget):
         self.show_retracts = True
         self.worker = None
         self.preview_worker = None
+
+        self.cfg = {s: load_section(s) for s in ("noise", "offset", "view")}
+        self.fields = {"noise": {}, "offset": {}, "view": {}}  # ключ -> спинбокс
 
         pg.setConfigOptions(antialias=True) # сглаживание отображения
 
@@ -302,77 +280,35 @@ class GCodeConverterApp(QWidget):
 
         self.tabs = QTabWidget()
 
-        # ВКЛАДКА НАСТРОЕК ДВУХУРОВНЕВОГО ШУМА
-        tab_noise = QWidget()
+        # --- Шум ---
         form_noise = QFormLayout()
-
-        self.sp_tremor_freq = QDoubleSpinBox()
-        self.sp_tremor_freq.setRange(0.1, 20.0)
-        self.sp_tremor_freq.setValue(DEFAULT_CONST.get("tremor_freq", 5.0))
-        self.sp_tremor_freq.setSingleStep(0.5)
-
-        self.sp_tremor_amp = QDoubleSpinBox()
-        self.sp_tremor_amp.setRange(0.0, 1.0)
-        self.sp_tremor_amp.setValue(DEFAULT_CONST.get("tremor_amp", 0.03))
-        self.sp_tremor_amp.setSingleStep(0.005)
-        self.sp_tremor_amp.setDecimals(3)
-
-        self.sp_height_freq = QDoubleSpinBox()
-        self.sp_height_freq.setRange(0.01, 5.0)
-        self.sp_height_freq.setValue(DEFAULT_CONST.get("height_freq", 0.12))
-        self.sp_height_freq.setSingleStep(0.02)
-
-        self.sp_height_amp = QDoubleSpinBox()
-        self.sp_height_amp.setRange(0.0, 2.0)
-        self.sp_height_amp.setValue(DEFAULT_CONST.get("height_amp", 0.28))
-        self.sp_height_amp.setSingleStep(0.02)
-
-        self.sp_fade_factor_1 = QDoubleSpinBox()
-        self.sp_fade_factor_1.setRange(0.1, 50.0)
-        self.sp_fade_factor_1.setValue(DEFAULT_CONST.get("fade_factor_1", 1.5))
-        self.sp_fade_factor_1.setSingleStep(0.5)
-
-        self.sp_fade_factor_2 = QDoubleSpinBox()
-        self.sp_fade_factor_2.setRange(0.1, 50.0)
-        self.sp_fade_factor_2.setValue(DEFAULT_CONST.get("fade_factor_2", 4.0))
-        self.sp_fade_factor_2.setSingleStep(0.5)
-
         form_noise.addRow(QLabel("<b>Шаг 1: Микро-дрожание руки</b>"))
-        form_noise.addRow("Частота дрожания (Tremor Freq):", self.sp_tremor_freq)
-        form_noise.addRow("Амплитуда дрожания (Tremor Amp, мм):", self.sp_tremor_amp)
+        form_noise.addRow("Частота дрожания (Tremor Freq):", self._spin("noise", "tremor_freq", 0.1, 20.0, 0.5))
+        form_noise.addRow("Амплитуда дрожания (Tremor Amp, мм):", self._spin("noise", "tremor_amp", 0.0, 1.0, 0.005, 3))
         form_noise.addRow(QLabel("<b>Шаг 2: Искажение высоты строк</b>"))
-        form_noise.addRow("Частота волны букв (Height Freq):", self.sp_height_freq)
-        form_noise.addRow("Амплитуда уплывания (Height Amp, мм):", self.sp_height_amp)
+        form_noise.addRow("Частота волны букв (Height Freq):", self._spin("noise", "height_freq", 0.01, 5.0, 0.02))
+        form_noise.addRow("Амплитуда уплывания (Height Amp, мм):", self._spin("noise", "height_amp", 0.0, 2.0, 0.02))
         form_noise.addRow(QLabel("<b>Параметры зон затухания (мм)</b>"))
-        form_noise.addRow("Разгон/затухание дрожания (Fade 1):", self.sp_fade_factor_1)
-        form_noise.addRow("Разгон/затухание волны (Fade 2):", self.sp_fade_factor_2)
+        form_noise.addRow("Разгон/затухание дрожания (Fade 1):", self._spin("noise", "fade_factor_1", 0.1, 50.0, 0.5))
+        form_noise.addRow("Разгон/затухание волны (Fade 2):", self._spin("noise", "fade_factor_2", 0.1, 50.0, 0.5))
 
-        tab_noise.setLayout(form_noise)
-
-        # Вкладка настроек ПАУЗЫ И СМЕЩЕНИЯ
-        tab_offset = QWidget()
+        # --- Смещение и паузы ---
         form_offset = QFormLayout()
-        self.sp_l = QDoubleSpinBox()
-        self.sp_l.setRange(0.0, 10.0)
-        self.sp_l.setValue(DEFAULT_CONST.get("defa_l", 0.05))
-        self.sp_l.setDecimals(3)
+        form_offset.addRow("Стандартный z_offset (l, мм):", self._spin("offset", "defa_l", 0.0, 10.0, 0.01, 3))
+        form_offset.addRow("Выдвижение карандаша (S, мм):", self._spin("offset", "defa_s", 0.0, 10.0, 0.05))
+        form_offset.addRow("Дистанция до паузы (мм):", self._spin("offset", "pause_dist", 100.0, 100000.0, 500.0))
 
-        self.sp_S = QDoubleSpinBox()
-        self.sp_S.setRange(0.0, 10.0)
-        self.sp_S.setValue(DEFAULT_CONST.get("defa_s", 0.75))
+        # --- Вид ---
+        form_view = QFormLayout()
+        form_view.addRow("Толщина пера (мм):", self._spin("view", "pen_width_mm", 0.05, 5.0, 0.05))
+        form_view.addRow("Ширина стола X (мм):", self._spin("view", "bed_x", 10.0, 5000.0, 10.0, 1))
+        form_view.addRow("Длина стола Y (мм):", self._spin("view", "bed_y", 10.0, 5000.0, 10.0, 1))
+        form_view.addRow("Порог Z «карандаш опущен» (мм):", self._spin("view", "pen_down_z", -10.0, 50.0, 0.1))
+        form_view.addRow("Допуск прореживания (мм):", self._spin("view", "simplify_eps", 0.001, 1.0, 0.005, 3))
 
-        self.sp_pause_dist = QDoubleSpinBox()
-        self.sp_pause_dist.setRange(100.0, 100000.0)
-        self.sp_pause_dist.setValue(DEFAULT_CONST.get("pause_dist", 6000.0))
-        self.sp_pause_dist.setSingleStep(500.0)
-
-        form_offset.addRow("Стандартный z_offset (l, мм):", self.sp_l)
-        form_offset.addRow("Выдвижение карандаша (S, мм):", self.sp_S)
-        form_offset.addRow("Дистанция до паузы (мм):", self.sp_pause_dist)
-        tab_offset.setLayout(form_offset)
-
-        self.tabs.addTab(tab_noise, "Параметры шума")
-        self.tabs.addTab(tab_offset, "Параметры смещения")
+        self.tabs.addTab(self._make_tab("noise", form_noise), "Параметры шума")
+        self.tabs.addTab(self._make_tab("offset", form_offset), "Параметры смещения")
+        self.tabs.addTab(self._make_tab("view", form_view), "Параметры вида")
 
         self.btn_start = QPushButton('Запустить конвейер преобразования', self)
         self.btn_start.setStyleSheet("background-color: #2baf2b; color: white; font-weight: bold; height: 35px;")
@@ -424,30 +360,19 @@ class GCodeConverterApp(QWidget):
 
         # Виджет 3D графики OpenGL
         self.plot = pg.PlotWidget()
-        self.plot.setAspectLocked(True)  # 1 мм по X = 1 мм по Y
+        self.plot.setAspectLocked(True)
         self.plot.showGrid(x=True, y=True, alpha=0.3)
-        self.plot.getAxis('bottom').setTickSpacing(50, 10)  # крупная сетка 50 мм, мелкая 10 мм
-        self.plot.getAxis('left').setTickSpacing(50, 10)
-        self.plot.setLimits(xMin=-50, xMax=BED_X + 50, yMin=-50, yMax=BED_Y + 50)
-        self.plot.setRange(xRange=(0, BED_X), yRange=(0, BED_Y), padding=0.03)
 
-        # контур стола 400x435
-        self.plot.addItem(pg.PlotCurveItem(
-            [0, BED_X, BED_X, 0, 0], [0, 0, BED_Y, BED_Y, 0],
-            pen=pg.mkPen((255, 200, 0), width=2)))
+        self.bed_outline = pg.PlotCurveItem(pen=pg.mkPen((255, 200, 0), width=2))
+        self.plot.addItem(self.bed_outline)
 
-        work_pen = pg.mkPen(color=(0, 200, 255), width=PEN_WIDTH_MM, cosmetic=False)
-        #work_pen.setCapStyle(Qt.RoundCap)  # скруглённые концы и стыки, как у грифеля
-        #work_pen.setJoinStyle(Qt.RoundJoin)
-        work_pen.setJoinStyle(Qt.BevelJoin)
-        work_pen.setCapStyle(Qt.RoundCap)  # концы штрихов оставьте круглыми, их мало
-
-        # две кривые: рабочая и холостая; 'finite' разрывает линию на NaN
         self.travel_curve = pg.PlotCurveItem(pen=pg.mkPen((255, 60, 60, 110), width=1), connect='finite')
-        self.work_curve = pg.PlotCurveItem(pen=work_pen, connect='finite')
+        self.work_curve = pg.PlotCurveItem(
+            pen=self.make_work_pen(self.cfg["view"]["pen_width_mm"]), connect='finite')
         self.plot.addItem(self.travel_curve)
         self.plot.addItem(self.work_curve)
 
+        self.apply_view_settings()  # сетка, лимиты, контур стола, перо
         right_panel.addWidget(self.plot, stretch=1)
 
         # Панель управления 3D слоями и холостыми ходами
@@ -478,6 +403,9 @@ class GCodeConverterApp(QWidget):
         main_layout.addLayout(right_panel, stretch=3)
         self.setLayout(main_layout)
 
+        for sp in self.fields["view"].values():
+            sp.valueChanged.connect(self.apply_view_settings)
+
     def open_file(self):
         file_path, _ = QFileDialog.getOpenFileName(
             self, 'Открыть файл G-code', '', 'G-code файлы (*.gcode *.nc *.tap *.txt);;Все файлы (*)'
@@ -500,18 +428,20 @@ class GCodeConverterApp(QWidget):
         name_part, ext_part = os.path.splitext(file_name)
         self.output_file = os.path.join(dir_name, f"{name_part}_modified{ext_part}")
 
+        n = self.collect("noise")
         noise_cfg = {
-            "tremor_frequency": self.sp_tremor_freq.value(),
-            "tremor_amplitude": self.sp_tremor_amp.value(),
-            "height_frequency": self.sp_height_freq.value(),
-            "height_amplitude": self.sp_height_amp.value(),
-            "fade_factor_1": self.sp_fade_factor_1.value(),
-            "fade_factor_2": self.sp_fade_factor_2.value(),
+            "tremor_frequency": n["tremor_freq"],
+            "tremor_amplitude": n["tremor_amp"],
+            "height_frequency": n["height_freq"],
+            "height_amplitude": n["height_amp"],
+            "fade_factor_1": n["fade_factor_1"],
+            "fade_factor_2": n["fade_factor_2"],
         }
+        o = self.collect("offset")
         offset_cfg = {
-            "l": self.sp_l.value(),
-            "S": self.sp_S.value(),
-            "distance_to_pause": self.sp_pause_dist.value(),
+            "l": o["defa_l"],
+            "S": o["defa_s"],
+            "distance_to_pause": o["pause_dist"],
         }
 
         self.info_text.clear()
@@ -546,6 +476,7 @@ class GCodeConverterApp(QWidget):
 
     def on_result(self, ok, html):
         self.info_text.setHtml(html)
+        v = self.collect("view")
         if not ok:
             self.lbl_stage.setText("Ошибка")
             self.set_busy(False)
@@ -554,7 +485,7 @@ class GCodeConverterApp(QWidget):
         # Старт остаётся заблокированным до его окончания
         self.set_busy(True, cancellable=False)
         self.lbl_stage.setText("Построение предпросмотра...")
-        self.preview_worker = PreviewWorker(self.output_file, self)
+        self.preview_worker = PreviewWorker(self.output_file, v["simplify_eps"], v["pen_down_z"], self)
         self.preview_worker.ready.connect(self.on_preview_ready)
         self.preview_worker.failed.connect(self.on_preview_failed)
         self.preview_worker.start()
@@ -595,8 +526,73 @@ class GCodeConverterApp(QWidget):
                 w.wait()
         super().closeEvent(event)
 
+    def _spin(self, section, key, lo, hi, step, decimals=2):
+        sp = QDoubleSpinBox()
+        sp.setRange(lo, hi)
+        sp.setDecimals(decimals)
+        sp.setSingleStep(step)
+        sp.setValue(self.cfg[section][key])
+        self.fields[section][key] = sp
+        return sp
 
+    def _make_tab(self, section, form):
+        tab = QWidget()
+        lay = QVBoxLayout(tab)
+        lay.addLayout(form)
+        lay.addStretch(1)
+        btn_restore = QPushButton("Восстановить по умолчанию")
+        btn_save = QPushButton("Сохранить по умолчанию")
+        btn_restore.clicked.connect(lambda _=False, s=section: self.restore_defaults(s))
+        btn_save.clicked.connect(lambda _=False, s=section: self.save_defaults(s))
+        row = QHBoxLayout()
+        row.addWidget(btn_restore)
+        row.addWidget(btn_save)
+        lay.addLayout(row)
+        return tab
 
+    def collect(self, section):
+        """Текущие значения раздела: сохранённые + то, что стоит в спинбоксах."""
+        values = dict(self.cfg[section])
+        values.update({k: sp.value() for k, sp in self.fields[section].items()})
+        return values
+
+    def restore_defaults(self, section):
+        try:
+            self.cfg[section] = load_section(section)
+        except Exception as e:
+            QMessageBox.warning(self, "Настройки", f"Не удалось прочитать файл настроек:\n{e}")
+            return
+        for key, sp in self.fields[section].items():
+            sp.setValue(self.cfg[section][key])
+        if section == "view":
+            self.apply_view_settings()
+        self.lbl_stage.setText("Настройки восстановлены")
+
+    def save_defaults(self, section):
+        values = self.collect(section)
+        try:
+            save_section(section, values)
+        except Exception as e:
+            QMessageBox.warning(self, "Настройки", f"Не удалось записать файл настроек:\n{e}")
+            return
+        self.cfg[section] = values
+        self.lbl_stage.setText("Настройки сохранены")
+
+    def make_work_pen(self, width_mm):
+        pen = pg.mkPen(color=(0, 200, 255), width=width_mm, cosmetic=False)
+        pen.setJoinStyle(Qt.BevelJoin)
+        pen.setCapStyle(Qt.RoundCap)
+        return pen
+
+    def apply_view_settings(self):
+        v = self.collect("view")
+        bx, by, m = v["bed_x"], v["bed_y"], v["view_margin"]
+        self.plot.getAxis('bottom').setTickSpacing(v["grid_major"], v["grid_minor"])
+        self.plot.getAxis('left').setTickSpacing(v["grid_major"], v["grid_minor"])
+        self.plot.setLimits(xMin=-m, xMax=bx + m, yMin=-m, yMax=by + m)
+        self.plot.setRange(xRange=(0, bx), yRange=(0, by), padding=v["view_padding"])
+        self.bed_outline.setData([0, bx, bx, 0, 0], [0, 0, by, by, 0])
+        self.work_curve.setPen(self.make_work_pen(v["pen_width_mm"]))
 
     def toggle_retracts_visibility(self):
         self.show_retracts = not self.btn_toggle_retracts.isChecked()

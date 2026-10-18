@@ -1,0 +1,10 @@
+{
+  "noise": {
+    "tremor_freq": 1.14,
+    "tremor_amp": 0.18,
+    "height_freq": 0.09,
+    "height_amp": 0.41,
+    "fade_factor_1": 5.2,
+    "fade_factor_2": 12.1
+  }
+}
