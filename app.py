@@ -17,7 +17,7 @@ import pyqtgraph as pg
 from handwritten import process_noise
 from v_offset import modify_z_properties
 
-PEN_WIDTH_MM = 0.5            # толщина карандаша
+PEN_WIDTH_MM = 0.3            # толщина карандаша
 
 BED_X, BED_Y = 400.0, 435.0   # рабочая область, мм
 PEN_DOWN_Z = 1.0              # Z ниже этого значения = карандаш на бумаге
@@ -28,12 +28,12 @@ CMD_RE = re.compile(r'^G(0|1|90|91)(?!\d)', re.IGNORECASE)
 #default config
 DEFAULT_CONST = {
     #МИКРО дрожания руки:
-    "tremor_freq": 5.0, # Частота микро дрожи
-    "tremor_amp": 0.06, # Амплитуда микродрожи  (мм)
+    "tremor_freq": 2.0, # Частота микро дрожи
+    "tremor_amp": 0.11, # Амплитуда микродрожи  (мм)
 
     # Ступень 2: Уход высоты букв (Низкая частота, большая амплитуда)
-    "height_freq": 0.09, # Частота Ступени 2: Уход высоты букв (Низкая частота, большая амплитуда)
-    "height_amp": 0.68,  # Амплитуда (мм)
+    "height_freq": 0.11, # Частота Ступени 2: Уход высоты букв (Низкая частота, большая амплитуда)
+    "height_amp": 0.55,  # Амплитуда (мм)
 
     # # Зоны плавного перехода fade (в миллиметрах)
     "fade_factor_1": 5.2,    # Расстояние полного нарастания для fade1  (мм)
@@ -300,7 +300,7 @@ class GCodeConverterApp(QWidget):
                 os.remove(temp_noise_file)
 
             # Выводим сообщение об успехе
-            QMessageBox.information(self, 'Успех', msg_text)
+            #QMessageBox.information(self, 'Успех', msg_text)
 
             # Шаг 3. Загрузка в текстовое окно предпросмотра
             self.load_preview()
