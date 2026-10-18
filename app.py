@@ -17,7 +17,7 @@ import pyqtgraph as pg
 from handwritten import process_noise
 from v_offset import modify_z_properties
 
-PEN_WIDTH_MM = 0.3            # толщина карандаша
+PEN_WIDTH_MM = 0.45            # толщина карандаша
 
 BED_X, BED_Y = 400.0, 435.0   # рабочая область, мм
 PEN_DOWN_Z = 1.0              # Z ниже этого значения = карандаш на бумаге
@@ -28,12 +28,12 @@ CMD_RE = re.compile(r'^G(0|1|90|91)(?!\d)', re.IGNORECASE)
 #default config
 DEFAULT_CONST = {
     #МИКРО дрожания руки:
-    "tremor_freq": 2.0, # Частота микро дрожи
-    "tremor_amp": 0.11, # Амплитуда микродрожи  (мм)
+    "tremor_freq": 1.14, # Частота микро дрожи
+    "tremor_amp": 0.18, # Амплитуда микродрожи  (мм)
 
     # Ступень 2: Уход высоты букв (Низкая частота, большая амплитуда)
-    "height_freq": 0.11, # Частота Ступени 2: Уход высоты букв (Низкая частота, большая амплитуда)
-    "height_amp": 0.55,  # Амплитуда (мм)
+    "height_freq": 0.09, # Частота Ступени 2: Уход высоты букв (Низкая частота, большая амплитуда)
+    "height_amp": 0.41,  # Амплитуда (мм)
 
     # # Зоны плавного перехода fade (в миллиметрах)
     "fade_factor_1": 5.2,    # Расстояние полного нарастания для fade1  (мм)
@@ -45,6 +45,51 @@ DEFAULT_CONST = {
     "defa_s": 0.75, # Выдвижение карандаша (S, мм):
     "defa_l": 0.05 # Стандартный z_offset (l, мм)
 }
+
+
+# Упрощение отрисовки предпросмотра gcode
+def rdp_mask(pts, eps):
+    n = len(pts)
+    keep = np.zeros(n, bool)
+    keep[0] = keep[-1] = True
+    stack = [(0, n - 1)]
+    while stack:
+        i, j = stack.pop()
+        if j <= i + 1:
+            continue
+        a, b = pts[i], pts[j]
+        seg = pts[i + 1:j]
+        d = b - a
+        L = np.hypot(d[0], d[1])
+        if L == 0:
+            dist = np.hypot(seg[:, 0] - a[0], seg[:, 1] - a[1])
+        else:
+            dist = np.abs(d[0] * (seg[:, 1] - a[1]) - d[1] * (seg[:, 0] - a[0])) / L
+        k = int(dist.argmax())
+        if dist[k] > eps:
+            k += i + 1
+            keep[k] = True
+            stack.append((i, k))
+            stack.append((k, j))
+    return keep
+
+
+def simplify_nan_polyline(arr, eps=0.03):
+    """Упрощает полилинии, разделённые NaN-строками."""
+    if len(arr) == 0:
+        return arr
+    parts = np.split(arr, np.flatnonzero(np.isnan(arr[:, 0])))
+    out = []
+    for p in parts:
+        if len(p) and np.isnan(p[0, 0]):
+            p = p[1:]
+        if len(p) == 0:
+            continue
+        if len(p) > 2:
+            p = p[rdp_mask(p, eps)]
+        out.append(p)
+        out.append(np.array([[np.nan, np.nan]]))
+    return np.vstack(out[:-1]) if out else arr
 
 
 class GCodeConverterApp(QWidget):
@@ -199,8 +244,10 @@ class GCodeConverterApp(QWidget):
             pen=pg.mkPen((255, 200, 0), width=2)))
 
         work_pen = pg.mkPen(color=(0, 200, 255), width=PEN_WIDTH_MM, cosmetic=False)
-        work_pen.setCapStyle(Qt.RoundCap)  # скруглённые концы и стыки, как у грифеля
-        work_pen.setJoinStyle(Qt.RoundJoin)
+        #work_pen.setCapStyle(Qt.RoundCap)  # скруглённые концы и стыки, как у грифеля
+        #work_pen.setJoinStyle(Qt.RoundJoin)
+        work_pen.setJoinStyle(Qt.BevelJoin)
+        work_pen.setCapStyle(Qt.RoundCap)  # концы штрихов оставьте круглыми, их мало
 
         # две кривые: рабочая и холостая; 'finite' разрывает линию на NaN
         self.travel_curve = pg.PlotCurveItem(pen=pg.mkPen((255, 60, 60, 110), width=1), connect='finite')
@@ -376,8 +423,10 @@ class GCodeConverterApp(QWidget):
                         add('travel', travel, (x, y), (nx, ny))
                 x, y, z = nx, ny, nz
 
-        self.work_xy = np.array(work, dtype=np.float64).reshape(-1, 2)
-        self.travel_xy = np.array(travel, dtype=np.float64).reshape(-1, 2)
+        #self.work_xy = np.array(work, dtype=np.float64).reshape(-1, 2)
+        self.work_xy = simplify_nan_polyline(np.array(work, dtype=np.float64).reshape(-1, 2), eps=0.03)
+        #self.travel_xy = np.array(travel, dtype=np.float64).reshape(-1, 2)
+        self.travel_xy = simplify_nan_polyline(np.array(travel, dtype=np.float64).reshape(-1, 2), eps=0.03)
 
         self.travel_curve.setData(self.travel_xy[:, 0], self.travel_xy[:, 1])
         self.travel_curve.setVisible(self.show_retracts)
