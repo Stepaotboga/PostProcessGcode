@@ -1,10 +1,29 @@
 import math
 import re
 import os
+import time  # не обязательно, но пригодится
 
 
 num_perlins_noises = 2 #количество ступеней шума перлина
 
+
+def _count_lines(path): # подсчет строк в файле
+    with open(path, "rb") as f:
+        return sum(1 for _ in f)
+
+def _tick(progress, i, total, step=100): # отвечает в статусбар процесс работы
+    """Сообщает долю выполнения этапа (0..1) каждые `step` строк."""
+    if progress and i % step == 0:
+        progress(i / max(total, 1))
+
+# Веса времени обработки файлв работы
+STAGES = [
+    ("Дробление отрезков", 0.15),
+    ("Расчёт разгона fade", 0.15),
+    ("Расчёт затухания fade", 0.15),
+    ("Наложение шума Перлина", 0.40),
+    ("Удаление мелких перемещений", 0.15),
+]
 
 
 # Быстрая и независимая реализация шума Перлина (без сторонних библиотек)
@@ -91,7 +110,7 @@ def calculate_perlin_shifts(x, y, config, f1_val, f2_val):
     return total_shift_x, total_shift_y
 
 
-def apply_perlin_noise_to_segmented_gcode(input_file, output_file, config):
+def apply_perlin_noise_to_segmented_gcode(input_file, output_file, config, progress=None):
     """
     Считывает готовый файл (где траектории уже разбиты на отрезки по 0.25 мм),
     извлекает значения fade1/fade2 и накладывает двухуровневый шум Перлина на координаты.
@@ -106,11 +125,13 @@ def apply_perlin_noise_to_segmented_gcode(input_file, output_file, config):
     # Координаты отслеживания идеального положения (без шума)
     curr_x, curr_y = 0.0, 0.0
 
+    total = _count_lines(input_file)
     with open(input_file, "r", encoding="utf-8") as infile, open(
             output_file, "w", encoding="utf-8"
     ) as outfile:
 
-        for line in infile:
+        for idx, line in enumerate(infile):
+            _tick(progress, idx, total)
             stripped = line.strip()
 
             # Обрабатываем только рабочие перемещения плоттера. Холостой ход G0 не трогаем.
@@ -160,53 +181,39 @@ def apply_perlin_noise_to_segmented_gcode(input_file, output_file, config):
 
             outfile.write(stripped + "\n")
 
+    if progress: progress(1.0)
 
-def process_noise(input_file, output_file, config):
-    # Временные файлы для промежуточных этапов
-    # 1. Получаем имя файла без расширения (например, из "C:/gcode/part.gcode" сделает "C:/gcode/part")
+
+def process_noise(input_file, output_file, config, progress=None):
+    """progress(stage_name: str, fraction: float 0..1 по всем этапам шума)."""
     base_dir, _ = os.path.splitext(input_file)
-
-    # 2. Создаем папку, если она еще не существует (exist_ok=True защитит от ошибок, если папка уже есть)
     os.makedirs(base_dir, exist_ok=True)
+    filename_no_ext = os.path.splitext(os.path.basename(input_file))[0]
 
-    # 3. Извлекаем чистое имя файла с расширением для генерации имен внутри папки
-    pure_filename = os.path.basename(input_file)
-    filename_no_ext, _ = os.path.splitext(pure_filename)
-
-    # 4. Формируем пути к временным файлам внутри созданной папки
-    segments_tmp = os.path.join(
-        base_dir, f"{filename_no_ext}_segments.gcode"
-    )
+    segments_tmp = os.path.join(base_dir, f"{filename_no_ext}_segments.gcode")
     normal_tmp = os.path.join(base_dir, f"{filename_no_ext}_normal.gcode")
     faded_tmp = os.path.join(base_dir, f"{filename_no_ext}_faded.gcode")
-    noise_tmp = os.path.join(
-        base_dir, f"{filename_no_ext}_noise_applied.gcode"
-    )
+    noise_tmp = os.path.join(base_dir, f"{filename_no_ext}_noise_applied.gcode")
 
-    # 1. Дробим отрезки
-    segment_splitting(input_file, segments_tmp, config)
-    print("segment_splitting done")
+    def run_stage(idx, func, *args):
+        name, weight = STAGES[idx]
+        start = sum(w for _, w in STAGES[:idx])
 
-    # 2. Считаем плавный разгон fade
-    calculate_fade_normal(segments_tmp, normal_tmp, config)
-    print("calculate_fade_normal done")
+        def cb(frac):
+            if progress:
+                progress(name, start + weight * frac)
 
-    # 3. Считаем плавное затухание fade с конца траекторий
-    calculate_fade_reverse(normal_tmp, faded_tmp, config)
-    print("calculate_fade_reverse done")
+        cb(0.0)
+        func(*args, progress=cb)
 
-    # 4. Накладываем шум Перлина на базе полученных fade коэффициентов
-    apply_perlin_noise_to_segmented_gcode(faded_tmp, noise_tmp, config)
-    print("perlin_noise done")
-
-    # 5. Очищаем траекторию от слишком малых перемещений (последний обработчик)
-    remove_small_movements(noise_tmp, output_file, min_distance=0.2)
-    print(
-        f"Шум наложен! Промежуточные файлы сохранены в папку: {base_dir}"
-    )
+    run_stage(0, segment_splitting, input_file, segments_tmp, config)
+    run_stage(1, calculate_fade_normal, segments_tmp, normal_tmp, config)
+    run_stage(2, calculate_fade_reverse, normal_tmp, faded_tmp, config)
+    run_stage(3, apply_perlin_noise_to_segmented_gcode, faded_tmp, noise_tmp, config)
+    run_stage(4, remove_small_movements, noise_tmp, output_file, 0.2)
 
 
-def calculate_fade_normal(input_file, output_file, config):
+def calculate_fade_normal(input_file, output_file, config, progress=None):
     """Добавляет строго ЛИНЕЙНЫЙ коэфф. затухания для шума Перлина."""
     x_re = re.compile(r"X\s*([0-9.-]+)", re.IGNORECASE)
     y_re = re.compile(r"Y\s*([0-9.-]+)", re.IGNORECASE)
@@ -226,11 +233,13 @@ def calculate_fade_normal(input_file, output_file, config):
     fade1_remove_pattern = r'\s*\bfade1=\d+(?:\.\d+)?\b\s*'
     fade2_remove_pattern = r'\s*\bfade2=\d+(?:\.\d+)?\b\s*'
 
+    total = _count_lines(input_file)
     with open(input_file, "r", encoding="utf-8") as infile, open(
             output_file, "w", encoding="utf-8"
     ) as outfile:
 
-        for line in infile:
+        for idx, line in enumerate(infile):
+            _tick(progress, idx, total)
             stripped = line.strip()
 
             if stripped.startswith("G1") or stripped.startswith("G0"):
@@ -277,8 +286,10 @@ def calculate_fade_normal(input_file, output_file, config):
 
             outfile.write(stripped + "\n")
 
+    if progress: progress(1.0)
 
-def calculate_fade_reverse(input_file, output_file, config):
+
+def calculate_fade_reverse(input_file, output_file, config, progress=None):
     """Добавляет коэфф. затухания, рассчитываемый с конца файла к началу."""
     x_re = re.compile(r"X\s*([0-9.-]+)", re.IGNORECASE)
     y_re = re.compile(r"Y\s*([0-9.-]+)", re.IGNORECASE)
@@ -317,8 +328,10 @@ def calculate_fade_reverse(input_file, output_file, config):
     # Инициализируем реверсивные коэффициенты (в конце файла они равны 0, если там fade=0, или 1)
     curr_rf1, curr_rf2 = 1.0, 1.0
 
+    n = len(lines)
     # Идем с конца в начало
-    for pos in range(len(lines) - 1, -1, -1):
+    for pos in range(n - 1, -1, -1):
+        _tick(progress, n - 1 - pos, n)
         line = lines[pos]
         stripped = line.strip()
 
@@ -372,8 +385,10 @@ def calculate_fade_reverse(input_file, output_file, config):
         for i in range(len(out_file_data) - 1, -1, -1):
             outfile.write(out_file_data[i] + "\n")
 
+    if progress: progress(1.0)
 
-def segment_splitting(input_file, output_file, config):
+
+def segment_splitting(input_file, output_file, config, progress=None):
     """
     Разбивает малые участки на сегменты по 0.25мм и сглаживает диагональные
     3D-подъемы (дорезку углов Aspire) по всем осям XYZ одновременно.
@@ -410,6 +425,7 @@ def segment_splitting(input_file, output_file, config):
 
     # 2. Итерируемся по строкам с анализом трехточечного окна
     for i in range(l_lines):
+        _tick(progress, i, l_lines) # ответ
         line = lines[i]
         stripped = line.strip()
 
@@ -515,8 +531,10 @@ def segment_splitting(input_file, output_file, config):
         for out_line in out_lines:
             outfile.write(out_line + "\n")
 
+    if progress: progress(1.0)
 
-def remove_small_movements(input_file, output_file, min_distance=0.2):
+
+def remove_small_movements(input_file, output_file, min_distance=0.2, progress=None):
     """
     Удаляет слишком малые перемещения G1 (меньше min_distance мм).
     Интерполирует (накапливает) перемещения по трем осям XYZ.
@@ -535,11 +553,12 @@ def remove_small_movements(input_file, output_file, min_distance=0.2):
     # Флаг, определяющий, были ли вообще инициализированы координаты в коде
     has_coords = False
 
+    total = _count_lines(input_file)
     with open(input_file, "r", encoding="utf-8") as infile, open(
             output_file, "w", encoding="utf-8"
     ) as outfile:
-
-        for line in infile:
+        for idx, line in enumerate(infile):
+            _tick(progress, idx, total)
             stripped = line.strip()
 
             if stripped.startswith("G1"):
@@ -620,3 +639,5 @@ def remove_small_movements(input_file, output_file, min_distance=0.2):
             else:
                 # Все остальные команды (M3, M5, комментарии и т.д.) пишем без изменений
                 outfile.write(stripped + "\n")
+
+    if progress: progress(1.0)

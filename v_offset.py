@@ -1,7 +1,7 @@
 import re
 import os
 
-def modify_z_properties(input_file, output_file, l=0.05, S=0.75, distance_to_pause=6000.0, z_limit=1.0):
+def modify_z_properties(input_file, output_file, l=0.05, S=0.75, distance_to_pause=6000.0, z_limit=1.0, progress=None):
     """Добавляет компенсацию z_offset и паузы для автоматического карандаша."""
     distance_to_zoffset = distance_to_pause * (l / S)
     distance_to_info = 200.0
@@ -21,10 +21,16 @@ def modify_z_properties(input_file, output_file, l=0.05, S=0.75, distance_to_pau
         dist_info = 0.0
         total_shift = 0.0
 
+        with open(input_file, 'rb') as f_cnt:
+            total_lines = sum(1 for _ in f_cnt)
+
         with open(input_file, 'r', encoding='utf-8') as f_in, \
                 open(output_file, 'w', encoding='utf-8') as f_out:
 
-            for line in f_in:
+            for idx, line in enumerate(f_in):
+                if progress and idx % 100 == 0: # счет прогресса
+                    progress(idx / max(total_lines, 1))
+
                 cleaned_line = line.strip()
 
                 if not cleaned_line or cleaned_line.startswith((';', '(')):

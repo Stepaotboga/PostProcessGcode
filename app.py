@@ -3,21 +3,25 @@ import os
 import re
 import webbrowser
 import numpy as np
+import time
 
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QPushButton, QVBoxLayout, QHBoxLayout,
     QFileDialog, QMessageBox, QLabel, QCheckBox, QGroupBox, QFormLayout,
-    QDoubleSpinBox, QTextEdit, QTabWidget, QSlider
+    QDoubleSpinBox, QTextEdit, QTabWidget, QSlider, QProgressBar
 )
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, QThread, pyqtSignal
 import pyqtgraph as pg
 
-
-# Импортируем обновленные модули
+# Импортируем собственные модули
 from handwritten import process_noise
 from v_offset import modify_z_properties
 
-PEN_WIDTH_MM = 0.45            # толщина карандаша
+
+"""qwertyuiop[]asdfghjkl;'zxcvbnm,./"""
+
+
+PEN_WIDTH_MM = 0.45            # толщина карандаша для отображения
 
 BED_X, BED_Y = 400.0, 435.0   # рабочая область, мм
 PEN_DOWN_Z = 1.0              # Z ниже этого значения = карандаш на бумаге
@@ -90,6 +94,71 @@ def simplify_nan_polyline(arr, eps=0.03):
         out.append(p)
         out.append(np.array([[np.nan, np.nan]]))
     return np.vstack(out[:-1]) if out else arr
+
+
+class ProcessWorker(QThread):
+    progress = pyqtSignal(int, str)        # процент, название этапа
+    result_ready = pyqtSignal(bool, str)   # успех, HTML-текст для инфо-виджета
+
+    def __init__(self, src, dst, use_noise, use_offset, noise_cfg, offset_cfg, parent=None):
+        super().__init__(parent)
+        self.src, self.dst = src, dst
+        self.use_noise, self.use_offset = use_noise, use_offset
+        self.noise_cfg, self.offset_cfg = noise_cfg, offset_cfg
+
+    def run(self):
+        temp = None
+        try:
+            t0 = time.time()
+            with open(self.src, 'rb') as f:
+                in_lines = sum(1 for _ in f)
+
+            current = self.src
+            # если Z-offset включён, шум занимает 90% полосы, иначе 100%
+            noise_share = 0.9 if self.use_offset else 1.0
+            path_len = None
+
+            if self.use_noise:
+                temp = os.path.join(os.path.dirname(self.src), "~temp_noise.gcode")
+
+                def noise_cb(name, frac):
+                    self.progress.emit(int(frac * noise_share * 100), name)
+
+                process_noise(current, temp, self.noise_cfg, noise_cb)
+                current = temp
+
+            if self.use_offset:
+                base = noise_share if self.use_noise else 0.0
+
+                def offset_cb(frac):
+                    self.progress.emit(int((base + (1 - base) * frac) * 100),
+                                       "Вставка Z-offset и пауз")
+
+                ok, res = modify_z_properties(
+                    input_file=current, output_file=self.dst, progress=offset_cb,
+                    **self.offset_cfg)
+                if not ok:
+                    raise RuntimeError(f"Ошибка в блоке z_offset: {res}")
+                path_len = res
+            else:
+                os.replace(current, self.dst)
+                temp = None
+
+            with open(self.dst, 'rb') as f:
+                out_lines = sum(1 for _ in f)
+
+            self.progress.emit(100, "Готово")
+            text = (f"<b>Готово:</b> {os.path.basename(self.dst)}<br>"
+                    f"Строк: {in_lines} → {out_lines}<br>")
+            if path_len is not None:
+                text += f"Длина траектории: {path_len:.2f} мм<br>"
+            text += f"Время обработки: {time.time() - t0:.1f} с"
+            self.result_ready.emit(True, text)
+        except Exception as e:
+            self.result_ready.emit(False, f"<span style='color:red'><b>Ошибка:</b> {e}</span>")
+        finally:
+            if temp and os.path.exists(temp):
+                os.remove(temp)
 
 
 class GCodeConverterApp(QWidget):
@@ -212,10 +281,27 @@ class GCodeConverterApp(QWidget):
         self.btn_start.setEnabled(False)
         self.btn_start.clicked.connect(self.process_file)
 
+        self.info_text = QTextEdit()
+        self.info_text.setReadOnly(True)
+        self.info_text.setMaximumHeight(110)
+        self.info_text.setPlaceholderText("Здесь появится информация об обработанном файле...")
+
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self.lbl_stage = QLabel("Ожидание")
+        self.lbl_stage.setMinimumWidth(190)
+
+        progress_row = QHBoxLayout()
+        progress_row.addWidget(self.progress_bar, stretch=1)
+        progress_row.addWidget(self.lbl_stage)
+
         left_panel.addWidget(self.label)
         left_panel.addWidget(self.btn_open)
         left_panel.addWidget(self.group_modules)
         left_panel.addWidget(self.tabs)
+        left_panel.addWidget(self.info_text)  # инфо о файле
+        left_panel.addLayout(progress_row)  # статус-бар + текущий этап
         left_panel.addWidget(self.btn_start)
 
         # --- ПРАВАЯ ПАНЕЛЬ: Текст + 3D Визуализатор ---
@@ -297,67 +383,68 @@ class GCodeConverterApp(QWidget):
     def process_file(self):
         if not self.selected_file:
             return
+        if not (self.chk_noise.isChecked() or self.chk_offset.isChecked()):
+            QMessageBox.warning(self, "Предупреждение", "Ни одна обработка не выбрана!")
+            return
 
-        # Задаем имя выходного файла
         dir_name, file_name = os.path.split(self.selected_file)
         name_part, ext_part = os.path.splitext(file_name)
         self.output_file = os.path.join(dir_name, f"{name_part}_modified{ext_part}")
 
-        # Создаем цепочку временных файлов
-        current_input = self.selected_file
-        temp_noise_file = os.path.join(dir_name, "~temp_noise.gcode")
+        # значения спинбоксов читаем здесь, в главном потоке
+        noise_cfg = {
+            "tremor_frequency": self.sp_tremor_freq.value(),
+            "tremor_amplitude": self.sp_tremor_amp.value(),
+            "height_frequency": self.sp_height_freq.value(),
+            "height_amplitude": self.sp_height_amp.value(),
+            "fade_factor_1": self.sp_fade_factor_1.value(),
+            "fade_factor_2": self.sp_fade_factor_2.value(),
+        }
+        offset_cfg = {
+            "l": self.sp_l.value(),
+            "S": self.sp_S.value(),
+            "distance_to_pause": self.sp_pause_dist.value(),
+        }
 
-        try:
-            # Шаг 1. Обработка ИСКУССТВЕННОГО ДВУХУРОВНЕВОГО ШУМА
-            if self.chk_noise.isChecked():
-                # Передаем конфигурацию, считанную напрямую из элементов графического окна интерфейса
-                noise_config = {
-                    "tremor_frequency": self.sp_tremor_freq.value(),
-                    "tremor_amplitude": self.sp_tremor_amp.value(),
-                    "height_frequency": self.sp_height_freq.value(),
-                    "height_amplitude": self.sp_height_amp.value(),
-                    "fade_factor_1": self.sp_fade_factor_1.value(),
-                    "fade_factor_2": self.sp_fade_factor_2.value()
-                }
-                process_noise(current_input, temp_noise_file, noise_config)
-                current_input = temp_noise_file
+        self.info_text.clear()
+        self.progress_bar.setValue(0)
+        self.set_busy(True)
 
-            # Шаг 2. Обработка СМЕЩЕНИЙ И ПАУЗ
-            if self.chk_offset.isChecked():
-                success, res_val = modify_z_properties(
-                    input_file=current_input,
-                    output_file=self.output_file,
-                    l=self.sp_l.value(),
-                    S=self.sp_S.value(),
-                    distance_to_pause=self.sp_pause_dist.value()
-                )
-                if not success:
-                    raise Exception(f"Ошибка в блоке z_offset: {res_val}")
-                msg_text = f"Успешно обработано!\nОбщая длина траектории: {res_val:.2f} мм\nСохранено в: {os.path.basename(self.output_file)}"
-            else:
-                if current_input != self.selected_file:
-                    os.replace(current_input, self.output_file)
-                else:
-                    QMessageBox.warning(self, "Предупреждение", "Ни одна обработка не выбрана!")
-                    return
-                msg_text = f"Обработка завершена (без Z-offset).\nСохранено в: {os.path.basename(self.output_file)}"
+        self.worker = ProcessWorker(
+            self.selected_file, self.output_file,
+            self.chk_noise.isChecked(), self.chk_offset.isChecked(),
+            noise_cfg, offset_cfg, self)
+        self.worker.progress.connect(self.on_progress)
+        self.worker.result_ready.connect(self.on_result)
+        self.worker.start()
 
-            # Удаляем временный файл шума, если он создавался
-            if os.path.exists(temp_noise_file):
-                os.remove(temp_noise_file)
+    def set_busy(self, busy):
+        self.btn_start.setEnabled(not busy)
+        self.btn_open.setEnabled(not busy)
+        self.group_modules.setEnabled(not busy)
+        self.tabs.setEnabled(not busy)
 
-            # Выводим сообщение об успехе
-            #QMessageBox.information(self, 'Успех', msg_text)
+    def on_progress(self, percent, stage):
+        self.progress_bar.setValue(percent)
+        self.lbl_stage.setText(stage)
 
-            # Шаг 3. Загрузка в текстовое окно предпросмотра
+    def on_result(self, ok, html):
+        self.info_text.setHtml(html)
+        if ok:
+            self.lbl_stage.setText("Построение предпросмотра...")
+            QApplication.processEvents()
             self.load_preview()
-            self.parse_and_build_3d()  # Генерация 3D сцены
+            self.parse_and_build_3d()
             self.btn_nc_viewer.setEnabled(True)
+            self.lbl_stage.setText("Готово")
+        else:
+            self.lbl_stage.setText("Ошибка")
+        self.set_busy(False)
 
-        except Exception as e:
-            QMessageBox.critical(self, 'Критическая ошибка', f"Произошел сбой при обработке:\n{str(e)}")
-            if os.path.exists(temp_noise_file):
-                os.remove(temp_noise_file)
+    def closeEvent(self, event):
+        if hasattr(self, 'worker') and self.worker.isRunning():
+            self.worker.wait()      # не закрываем окно посреди записи файлов
+        super().closeEvent(event)
 
     def load_preview(self):
         if not os.path.exists(self.output_file):
