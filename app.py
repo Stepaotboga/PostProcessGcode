@@ -10,12 +10,19 @@ from PyQt5.QtWidgets import (
     QDoubleSpinBox, QTextEdit, QTabWidget, QSlider
 )
 from PyQt5.QtCore import Qt
-from PyQt5.QtGui import QVector3D
-import pyqtgraph.opengl as gl
+import pyqtgraph as pg
+
 
 # Импортируем обновленные модули
 from handwritten import process_noise
 from v_offset import modify_z_properties
+
+
+BED_X, BED_Y = 400.0, 435.0   # рабочая область, мм
+PEN_DOWN_Z = 1.0              # Z ниже этого значения = карандаш на бумаге
+
+AXIS_RE = re.compile(r'([XYZ])\s*([-+]?\d*\.?\d+)', re.IGNORECASE)
+CMD_RE = re.compile(r'^G(0|1|90|91)(?!\d)', re.IGNORECASE)
 
 #default config
 DEFAULT_CONST = {
@@ -175,13 +182,26 @@ class GCodeConverterApp(QWidget):
         right_panel.addWidget(QLabel('<b>Интерактивный 3D Предпросмотр траектории плоттера:</b>'))
 
         # Виджет 3D графики OpenGL
-        self.gl_view = gl.GLViewWidget()
-        self.gl_view.opts['distance'] = 120
-        grid = gl.GLGridItem()
-        grid.setSize(x=300, y=300, z=0)
-        grid.setSpacing(x=10, y=10, z=0)
-        self.gl_view.addItem(grid)
-        right_panel.addWidget(self.gl_view, stretch=1)
+        self.plot = pg.PlotWidget()
+        self.plot.setAspectLocked(True)  # 1 мм по X = 1 мм по Y
+        self.plot.showGrid(x=True, y=True, alpha=0.3)
+        self.plot.getAxis('bottom').setTickSpacing(50, 10)  # крупная сетка 50 мм, мелкая 10 мм
+        self.plot.getAxis('left').setTickSpacing(50, 10)
+        self.plot.setLimits(xMin=-50, xMax=BED_X + 50, yMin=-50, yMax=BED_Y + 50)
+        self.plot.setRange(xRange=(0, BED_X), yRange=(0, BED_Y), padding=0.03)
+
+        # контур стола 400x435
+        self.plot.addItem(pg.PlotCurveItem(
+            [0, BED_X, BED_X, 0, 0], [0, 0, BED_Y, BED_Y, 0],
+            pen=pg.mkPen((255, 200, 0), width=2)))
+
+        # две кривые: рабочая и холостая; 'finite' разрывает линию на NaN
+        self.travel_curve = pg.PlotCurveItem(pen=pg.mkPen((255, 60, 60, 110), width=1), connect='finite')
+        self.work_curve = pg.PlotCurveItem(pen=pg.mkPen((0, 200, 255), width=1), connect='finite')
+        self.plot.addItem(self.travel_curve)
+        self.plot.addItem(self.work_curve)
+
+        right_panel.addWidget(self.plot, stretch=1)
 
         # Панель управления 3D слоями и холостыми ходами
         view_ctrl_layout = QHBoxLayout()
@@ -300,97 +320,78 @@ class GCodeConverterApp(QWidget):
         self.preview_text.setPlainText("".join(preview_lines))
 
     def parse_and_build_3d(self):
-        """Парсинг результирующего g-кода, разделение G0/G1 и заполнение массивов графики."""
+        """Парсит итоговый G-code в две NaN-разделённые полилинии (XY)."""
         if not os.path.exists(self.output_file):
             return
 
-        work_lst = []
-        retract_lst = []
-        curr_x, curr_y, curr_z = 0.0, 0.0, 0.0
+        nan = (float('nan'), float('nan'))
+        work, travel = [], []
+        last = {'work': None, 'travel': None}
 
-        x_re = re.compile(r'X([-+]?[0-9]*\.?[0-9]+)')
-        y_re = re.compile(r'Y([-+]?[0-9]*\.?[0-9]+)')
-        z_re = re.compile(r'Z([-+]?[0-9]*\.?[0-9]+)')
+        def add(kind, buf, p0, p1):
+            if last[kind] != p0:  # разрыв: начинаем новую линию
+                if buf:
+                    buf.append(nan)
+                buf.append(p0)
+            buf.append(p1)
+            last[kind] = p1
+
+        x, y, z = 0.0, 0.0, 20.0  # после G28 XY=0, Z заведомо поднят
+        absolute = True
 
         with open(self.output_file, 'r', encoding='utf-8', errors='ignore') as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith(';'):
+            for raw in f:
+                line = raw.split(';', 1)[0]
+                line = re.sub(r'\(.*?\)', '', line).strip()
+                m = CMD_RE.match(line)
+                if not m:
+                    continue
+                cmd = m.group(1)
+                if cmd == '90':
+                    absolute = True
+                    continue
+                if cmd == '91':
+                    absolute = False
                     continue
 
-                if line.startswith('G0') or line.startswith('G1'):
-                    is_g0 = line.startswith('G0')
+                ax = {k.upper(): float(v) for k, v in AXIS_RE.findall(line)}
+                nx, ny, nz = x, y, z
+                if absolute:
+                    nx, ny, nz = ax.get('X', x), ax.get('Y', y), ax.get('Z', z)
+                else:
+                    nx, ny, nz = x + ax.get('X', 0), y + ax.get('Y', 0), z + ax.get('Z', 0)
 
-                    match_x = x_re.search(line)
-                    match_y = y_re.search(line)
-                    match_z = z_re.search(line)
-
-                    if match_x: curr_x = float(match_x.group(1))
-                    if match_y: curr_y = float(match_y.group(1))
-                    if match_z: curr_z = float(match_z.group(1))
-
-                    if is_g0 or curr_z > 1.0:
-                        retract_lst.append([curr_x, curr_y, curr_z])
-                        retract_lst.append([np.nan, np.nan, np.nan])
+                if (nx, ny) != (x, y):
+                    pen_down = (cmd == '1' and nz < PEN_DOWN_Z)
+                    if pen_down:
+                        add('work', work, (x, y), (nx, ny))
                     else:
-                        work_lst.append([curr_x, curr_y, curr_z])
+                        add('travel', travel, (x, y), (nx, ny))
+                x, y, z = nx, ny, nz
 
-        # Очищаем старые объекты со сцены
-        if self.work_plot:
-            self.gl_view.removeItem(self.work_plot)
-        if self.retract_plot:
-            self.gl_view.removeItem(self.retract_plot)
+        self.work_xy = np.array(work, dtype=np.float64).reshape(-1, 2)
+        self.travel_xy = np.array(travel, dtype=np.float64).reshape(-1, 2)
 
-        self.work_points = np.array(work_lst, dtype=np.float32)
-        self.retract_points = np.array(retract_lst, dtype=np.float32)
+        self.travel_curve.setData(self.travel_xy[:, 0], self.travel_xy[:, 1])
+        self.travel_curve.setVisible(self.show_retracts)
+        self.update_layer_animation(100)
 
-        # Создание рабочей траектории (Бирюзовый цвет)
-        if len(self.work_points) > 0:
-            work_colors = np.array([0.0, 0.8, 1.0, 0.9], dtype=np.float32)
-            self.work_plot = gl.GLLinePlotItem(pos=self.work_points, color=work_colors, width=1.5, mode='line_strip')
-            self.gl_view.addItem(self.work_plot)
-
-            # ИСПРАВЛЕНО: Центрирование камеры с использованием QVector3D
-            center = self.work_points.mean(axis=0)
-            self.gl_view.setCameraPosition(pos=QVector3D(float(center[0]), float(center[1]), float(center[2])))
-
-        # Создание холостых ходов (Блекло-красный цвет)
-        if len(self.retract_points) > 0:
-            retract_colors = np.array([1.0, 0.2, 0.2, 0.3], dtype=np.float32)
-            self.retract_plot = gl.GLLinePlotItem(pos=self.retract_points, color=retract_colors, width=1.0,
-                                                  mode='lines')
-            if self.show_retracts:
-                self.gl_view.addItem(self.retract_plot)
-
-        if len(self.work_points) > 0:
-            self.slider_layers.setEnabled(True)
-            self.slider_layers.setValue(100)
+        self.slider_layers.setEnabled(len(self.work_xy) > 0)
+        self.slider_layers.blockSignals(True)
+        self.slider_layers.setValue(100)
+        self.slider_layers.blockSignals(False)
 
     def toggle_retracts_visibility(self):
-        """Прячет или показывает холостые траектории по клику на кнопку."""
-        if self.btn_toggle_retracts.isChecked():
-            self.btn_toggle_retracts.setText("Показать холостые ходы")
-            self.show_retracts = False
-            if self.retract_plot in self.gl_view.items:
-                self.gl_view.removeItem(self.retract_plot)
-        else:
-            self.btn_toggle_retracts.setText("Скрыть холостые ходы")
-            self.show_retracts = True
-            if self.retract_plot and self.retract_plot not in self.gl_view.items:
-                self.gl_view.addItem(self.retract_plot)
+        self.show_retracts = not self.btn_toggle_retracts.isChecked()
+        self.btn_toggle_retracts.setText(
+            "Показать холостые ходы" if not self.show_retracts else "Скрыть холостые ходы")
+        self.travel_curve.setVisible(self.show_retracts)
 
     def update_layer_animation(self, value):
-        """Отрезает отрисовку рабочей траектории в зависимости от положения ползунка слайдера."""
-        if self.work_plot is None or len(self.work_points) == 0:
+        if not hasattr(self, 'work_xy'):
             return
-
-        limit_idx = int((value / 100.0) * len(self.work_points))
-        if limit_idx < 2:
-            current_visible_points = np.empty((0, 3), dtype=np.float32)
-        else:
-            current_visible_points = self.work_points[:limit_idx]
-
-        self.work_plot.setData(pos=current_visible_points)
+        n = int(len(self.work_xy) * value / 100.0)
+        self.work_curve.setData(self.work_xy[:n, 0], self.work_xy[:n, 1])
 
     def open_in_nc_viewer(self):
         if not self.output_file or not os.path.exists(self.output_file):
