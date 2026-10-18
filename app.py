@@ -17,6 +17,7 @@ import pyqtgraph as pg
 from handwritten import process_noise
 from v_offset import modify_z_properties
 
+PEN_WIDTH_MM = 0.5            # толщина карандаша
 
 BED_X, BED_Y = 400.0, 435.0   # рабочая область, мм
 PEN_DOWN_Z = 1.0              # Z ниже этого значения = карандаш на бумаге
@@ -58,6 +59,8 @@ class GCodeConverterApp(QWidget):
         self.work_plot = None
         self.retract_plot = None
         self.show_retracts = True
+
+        pg.setConfigOptions(antialias=True) # сглаживание отображения
 
         self.initUI()
 
@@ -195,9 +198,13 @@ class GCodeConverterApp(QWidget):
             [0, BED_X, BED_X, 0, 0], [0, 0, BED_Y, BED_Y, 0],
             pen=pg.mkPen((255, 200, 0), width=2)))
 
+        work_pen = pg.mkPen(color=(0, 200, 255), width=PEN_WIDTH_MM, cosmetic=False)
+        work_pen.setCapStyle(Qt.RoundCap)  # скруглённые концы и стыки, как у грифеля
+        work_pen.setJoinStyle(Qt.RoundJoin)
+
         # две кривые: рабочая и холостая; 'finite' разрывает линию на NaN
         self.travel_curve = pg.PlotCurveItem(pen=pg.mkPen((255, 60, 60, 110), width=1), connect='finite')
-        self.work_curve = pg.PlotCurveItem(pen=pg.mkPen((0, 200, 255), width=1), connect='finite')
+        self.work_curve = pg.PlotCurveItem(pen=work_pen, connect='finite')
         self.plot.addItem(self.travel_curve)
         self.plot.addItem(self.work_curve)
 
