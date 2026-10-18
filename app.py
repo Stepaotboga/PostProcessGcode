@@ -95,10 +95,75 @@ def simplify_nan_polyline(arr, eps=0.03):
         out.append(np.array([[np.nan, np.nan]]))
     return np.vstack(out[:-1]) if out else arr
 
+def parse_gcode_xy(path, eps=0.03):
+    """Парсит G-code в две NaN-разделённые полилинии (XY). Виджетов не трогает."""
+    nan = (float('nan'), float('nan'))
+    work, travel = [], []
+    last = {'work': None, 'travel': None}
+
+    def add(kind, buf, p0, p1):
+        if last[kind] != p0:
+            if buf:
+                buf.append(nan)
+            buf.append(p0)
+        buf.append(p1)
+        last[kind] = p1
+
+    x, y, z = 0.0, 0.0, 20.0
+    absolute = True
+
+    with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+        for raw in f:
+            line = raw.split(';', 1)[0]
+            line = re.sub(r'\(.*?\)', '', line).strip()
+            m = CMD_RE.match(line)
+            if not m:
+                continue
+            cmd = m.group(1)
+            if cmd == '90':
+                absolute = True
+                continue
+            if cmd == '91':
+                absolute = False
+                continue
+
+            ax = {k.upper(): float(v) for k, v in AXIS_RE.findall(line)}
+            if absolute:
+                nx, ny, nz = ax.get('X', x), ax.get('Y', y), ax.get('Z', z)
+            else:
+                nx, ny, nz = x + ax.get('X', 0), y + ax.get('Y', 0), z + ax.get('Z', 0)
+
+            if (nx, ny) != (x, y):
+                if cmd == '1' and nz < PEN_DOWN_Z:
+                    add('work', work, (x, y), (nx, ny))
+                else:
+                    add('travel', travel, (x, y), (nx, ny))
+            x, y, z = nx, ny, nz
+
+    work_xy = simplify_nan_polyline(np.array(work, dtype=np.float64).reshape(-1, 2), eps)
+    travel_xy = simplify_nan_polyline(np.array(travel, dtype=np.float64).reshape(-1, 2), eps)
+    return work_xy, travel_xy
+
+
+def read_preview_text(path, max_lines=500):
+    lines = []
+    with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+        for i, line in enumerate(f):
+            if i >= max_lines:
+                lines.append("\n... [Код обрезан для экономии памяти предпросмотра] ...")
+                break
+            lines.append(line)
+    return "".join(lines)
+
+
+class ProcessCancelled(Exception):
+    pass
+
 
 class ProcessWorker(QThread):
-    progress = pyqtSignal(int, str)        # процент, название этапа
-    result_ready = pyqtSignal(bool, str)   # успех, HTML-текст для инфо-виджета
+    progress = pyqtSignal(int, str)
+    result_ready = pyqtSignal(bool, str)
+    cancelled = pyqtSignal()
 
     def __init__(self, src, dst, use_noise, use_offset, noise_cfg, offset_cfg, parent=None):
         super().__init__(parent)
@@ -106,15 +171,19 @@ class ProcessWorker(QThread):
         self.use_noise, self.use_offset = use_noise, use_offset
         self.noise_cfg, self.offset_cfg = noise_cfg, offset_cfg
 
+    def _check(self):
+        if self.isInterruptionRequested():
+            raise ProcessCancelled()
+
     def run(self):
         temp = None
+        dst_started = False
         try:
             t0 = time.time()
             with open(self.src, 'rb') as f:
                 in_lines = sum(1 for _ in f)
 
             current = self.src
-            # если Z-offset включён, шум занимает 90% полосы, иначе 100%
             noise_share = 0.9 if self.use_offset else 1.0
             path_len = None
 
@@ -122,6 +191,7 @@ class ProcessWorker(QThread):
                 temp = os.path.join(os.path.dirname(self.src), "~temp_noise.gcode")
 
                 def noise_cb(name, frac):
+                    self._check()                       # прерывание из колбэка
                     self.progress.emit(int(frac * noise_share * 100), name)
 
                 process_noise(current, temp, self.noise_cfg, noise_cb)
@@ -131,12 +201,17 @@ class ProcessWorker(QThread):
                 base = noise_share if self.use_noise else 0.0
 
                 def offset_cb(frac):
+                    self._check()
                     self.progress.emit(int((base + (1 - base) * frac) * 100),
                                        "Вставка Z-offset и пауз")
 
+                dst_started = True
                 ok, res = modify_z_properties(
                     input_file=current, output_file=self.dst, progress=offset_cb,
                     **self.offset_cfg)
+                # modify_z_properties ловит все исключения и возвращает (False, ...),
+                # поэтому отмену проверяем здесь отдельно
+                self._check()
                 if not ok:
                     raise RuntimeError(f"Ошибка в блоке z_offset: {res}")
                 path_len = res
@@ -154,11 +229,32 @@ class ProcessWorker(QThread):
                 text += f"Длина траектории: {path_len:.2f} мм<br>"
             text += f"Время обработки: {time.time() - t0:.1f} с"
             self.result_ready.emit(True, text)
+
+        except ProcessCancelled:
+            if dst_started and os.path.exists(self.dst):
+                os.remove(self.dst)                     # недописанный результат не оставляем
+            self.cancelled.emit()
         except Exception as e:
             self.result_ready.emit(False, f"<span style='color:red'><b>Ошибка:</b> {e}</span>")
         finally:
             if temp and os.path.exists(temp):
                 os.remove(temp)
+
+
+class PreviewWorker(QThread):
+    ready = pyqtSignal(object, object, str)   # work_xy, travel_xy, текст
+    failed = pyqtSignal(str)
+
+    def __init__(self, path, parent=None):
+        super().__init__(parent)
+        self.path = path
+
+    def run(self):
+        try:
+            work_xy, travel_xy = parse_gcode_xy(self.path)
+            self.ready.emit(work_xy, travel_xy, read_preview_text(self.path))
+        except Exception as e:
+            self.failed.emit(str(e))
 
 
 class GCodeConverterApp(QWidget):
@@ -173,6 +269,8 @@ class GCodeConverterApp(QWidget):
         self.work_plot = None
         self.retract_plot = None
         self.show_retracts = True
+        self.worker = None
+        self.preview_worker = None
 
         pg.setConfigOptions(antialias=True) # сглаживание отображения
 
@@ -292,6 +390,15 @@ class GCodeConverterApp(QWidget):
         self.lbl_stage = QLabel("Ожидание")
         self.lbl_stage.setMinimumWidth(190)
 
+        self.btn_cancel = QPushButton('Отмена')
+        self.btn_cancel.setStyleSheet("background-color: #c0392b; color: white; font-weight: bold; height: 35px;")
+        self.btn_cancel.setEnabled(False)
+        self.btn_cancel.clicked.connect(self.cancel_processing)
+
+        btn_row = QHBoxLayout()
+        btn_row.addWidget(self.btn_start, stretch=3)
+        btn_row.addWidget(self.btn_cancel, stretch=1)
+
         progress_row = QHBoxLayout()
         progress_row.addWidget(self.progress_bar, stretch=1)
         progress_row.addWidget(self.lbl_stage)
@@ -302,7 +409,7 @@ class GCodeConverterApp(QWidget):
         left_panel.addWidget(self.tabs)
         left_panel.addWidget(self.info_text)  # инфо о файле
         left_panel.addLayout(progress_row)  # статус-бар + текущий этап
-        left_panel.addWidget(self.btn_start)
+        left_panel.addLayout(btn_row)
 
         # --- ПРАВАЯ ПАНЕЛЬ: Текст + 3D Визуализатор ---
         right_panel.addWidget(QLabel('<b>Предпросмотр итогового G-кода:</b>'))
@@ -387,11 +494,12 @@ class GCodeConverterApp(QWidget):
             QMessageBox.warning(self, "Предупреждение", "Ни одна обработка не выбрана!")
             return
 
+        self.set_busy(True, cancellable=True)       # кнопка Старт блокируется сразу
+
         dir_name, file_name = os.path.split(self.selected_file)
         name_part, ext_part = os.path.splitext(file_name)
         self.output_file = os.path.join(dir_name, f"{name_part}_modified{ext_part}")
 
-        # значения спинбоксов читаем здесь, в главном потоке
         noise_cfg = {
             "tremor_frequency": self.sp_tremor_freq.value(),
             "tremor_amplitude": self.sp_tremor_amp.value(),
@@ -408,7 +516,7 @@ class GCodeConverterApp(QWidget):
 
         self.info_text.clear()
         self.progress_bar.setValue(0)
-        self.set_busy(True)
+        self.lbl_stage.setText("Запуск...")
 
         self.worker = ProcessWorker(
             self.selected_file, self.output_file,
@@ -416,13 +524,21 @@ class GCodeConverterApp(QWidget):
             noise_cfg, offset_cfg, self)
         self.worker.progress.connect(self.on_progress)
         self.worker.result_ready.connect(self.on_result)
+        self.worker.cancelled.connect(self.on_cancelled)
         self.worker.start()
 
-    def set_busy(self, busy):
+    def set_busy(self, busy, cancellable=False):
         self.btn_start.setEnabled(not busy)
+        self.btn_cancel.setEnabled(busy and cancellable)
         self.btn_open.setEnabled(not busy)
         self.group_modules.setEnabled(not busy)
         self.tabs.setEnabled(not busy)
+
+    def cancel_processing(self):
+        if self.worker is not None and self.worker.isRunning():
+            self.worker.requestInterruption()
+            self.btn_cancel.setEnabled(False)
+            self.lbl_stage.setText("Отмена...")
 
     def on_progress(self, percent, stage):
         self.progress_bar.setValue(percent)
@@ -430,99 +546,57 @@ class GCodeConverterApp(QWidget):
 
     def on_result(self, ok, html):
         self.info_text.setHtml(html)
-        if ok:
-            self.lbl_stage.setText("Построение предпросмотра...")
-            QApplication.processEvents()
-            self.load_preview()
-            self.parse_and_build_3d()
-            self.btn_nc_viewer.setEnabled(True)
-            self.lbl_stage.setText("Готово")
-        else:
+        if not ok:
             self.lbl_stage.setText("Ошибка")
+            self.set_busy(False)
+            return
+        # обработка завершена, строим предпросмотр во втором потоке;
+        # Старт остаётся заблокированным до его окончания
+        self.set_busy(True, cancellable=False)
+        self.lbl_stage.setText("Построение предпросмотра...")
+        self.preview_worker = PreviewWorker(self.output_file, self)
+        self.preview_worker.ready.connect(self.on_preview_ready)
+        self.preview_worker.failed.connect(self.on_preview_failed)
+        self.preview_worker.start()
+
+    def on_cancelled(self):
+        self.progress_bar.setValue(0)
+        self.lbl_stage.setText("Отменено")
+        self.info_text.setHtml("<b>Обработка отменена пользователем.</b>")
         self.set_busy(False)
 
-    def closeEvent(self, event):
-        if hasattr(self, 'worker') and self.worker.isRunning():
-            self.worker.wait()      # не закрываем окно посреди записи файлов
-        super().closeEvent(event)
+    def on_preview_ready(self, work_xy, travel_xy, text):
+        self.preview_text.setPlainText(text)
+        self.work_xy = work_xy
+        self.travel_xy = travel_xy
 
-    def load_preview(self):
-        if not os.path.exists(self.output_file):
-            return
-
-        preview_lines = []
-        with open(self.output_file, 'r', encoding='utf-8') as f:
-            for i, line in enumerate(f):
-                if i < 500:
-                    preview_lines.append(line)
-                else:
-                    preview_lines.append("\n... [Код обрезан для экономии памяти предпросмотра] ...")
-                    break
-        self.preview_text.setPlainText("".join(preview_lines))
-
-    def parse_and_build_3d(self):
-        """Парсит итоговый G-code в две NaN-разделённые полилинии (XY)."""
-        if not os.path.exists(self.output_file):
-            return
-
-        nan = (float('nan'), float('nan'))
-        work, travel = [], []
-        last = {'work': None, 'travel': None}
-
-        def add(kind, buf, p0, p1):
-            if last[kind] != p0:  # разрыв: начинаем новую линию
-                if buf:
-                    buf.append(nan)
-                buf.append(p0)
-            buf.append(p1)
-            last[kind] = p1
-
-        x, y, z = 0.0, 0.0, 20.0  # после G28 XY=0, Z заведомо поднят
-        absolute = True
-
-        with open(self.output_file, 'r', encoding='utf-8', errors='ignore') as f:
-            for raw in f:
-                line = raw.split(';', 1)[0]
-                line = re.sub(r'\(.*?\)', '', line).strip()
-                m = CMD_RE.match(line)
-                if not m:
-                    continue
-                cmd = m.group(1)
-                if cmd == '90':
-                    absolute = True
-                    continue
-                if cmd == '91':
-                    absolute = False
-                    continue
-
-                ax = {k.upper(): float(v) for k, v in AXIS_RE.findall(line)}
-                nx, ny, nz = x, y, z
-                if absolute:
-                    nx, ny, nz = ax.get('X', x), ax.get('Y', y), ax.get('Z', z)
-                else:
-                    nx, ny, nz = x + ax.get('X', 0), y + ax.get('Y', 0), z + ax.get('Z', 0)
-
-                if (nx, ny) != (x, y):
-                    pen_down = (cmd == '1' and nz < PEN_DOWN_Z)
-                    if pen_down:
-                        add('work', work, (x, y), (nx, ny))
-                    else:
-                        add('travel', travel, (x, y), (nx, ny))
-                x, y, z = nx, ny, nz
-
-        #self.work_xy = np.array(work, dtype=np.float64).reshape(-1, 2)
-        self.work_xy = simplify_nan_polyline(np.array(work, dtype=np.float64).reshape(-1, 2), eps=0.03)
-        #self.travel_xy = np.array(travel, dtype=np.float64).reshape(-1, 2)
-        self.travel_xy = simplify_nan_polyline(np.array(travel, dtype=np.float64).reshape(-1, 2), eps=0.03)
-
-        self.travel_curve.setData(self.travel_xy[:, 0], self.travel_xy[:, 1])
+        self.travel_curve.setData(travel_xy[:, 0], travel_xy[:, 1])
         self.travel_curve.setVisible(self.show_retracts)
-        self.update_layer_animation(100)
 
-        self.slider_layers.setEnabled(len(self.work_xy) > 0)
         self.slider_layers.blockSignals(True)
         self.slider_layers.setValue(100)
         self.slider_layers.blockSignals(False)
+        self.slider_layers.setEnabled(len(work_xy) > 0)
+        self.update_layer_animation(100)
+
+        self.btn_nc_viewer.setEnabled(True)
+        self.lbl_stage.setText("Готово")
+        self.set_busy(False)                         # только теперь Старт снова активен
+
+    def on_preview_failed(self, msg):
+        self.info_text.append(f"<span style='color:red'><b>Ошибка предпросмотра:</b> {msg}</span>")
+        self.lbl_stage.setText("Ошибка предпросмотра")
+        self.set_busy(False)
+
+    def closeEvent(self, event):
+        for w in (self.worker, self.preview_worker):
+            if w is not None and w.isRunning():
+                w.requestInterruption()
+                w.wait()
+        super().closeEvent(event)
+
+
+
 
     def toggle_retracts_visibility(self):
         self.show_retracts = not self.btn_toggle_retracts.isChecked()
