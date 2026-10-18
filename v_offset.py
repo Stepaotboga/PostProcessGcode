@@ -6,8 +6,8 @@ def modify_z_properties(input_file, output_file, l=0.05, S=0.75, distance_to_pau
     distance_to_zoffset = distance_to_pause * (l / S)
     distance_to_info = 200.0
 
-    Z_OFFSET_GCODE = f'SET_GCODE_OFFSET Z_ADJUST=-0.05 ; Сдвиг Z каждые 1000 мм\nRESPOND TYPE=echo MSG="Z-offset auto-adjusted by -0.05mm ({round(distance_to_zoffset, 3)} mm path reached)"\n'
-    PAUSE_GCODE = f'SET_GCODE_OFFSET Z=0.0\nRESPOND TYPE=echo MSG="PAUSE triggered: {round(distance_to_pause, 3)}mm path reached!"\nPAUSE\n'
+    Z_OFFSET_GCODE = f'SET_GCODE_OFFSET Z_ADJUST=-{l} ; Сдвиг Z каждые 1000 мм\nRESPOND TYPE=echo MSG="Z-offset auto-adjusted by -{l}mm ({round(distance_to_zoffset, 3)} mm path reached)"\n'
+    PAUSE_GCODE = f'RESPOND TYPE=echo MSG="PAUSE triggered: {round(distance_to_pause, 3)}mm path reached!"\nPAUSE\n'
 
     try:
         x_gcode_re = re.compile(r'X([-+]?[0-9]*\.?[0-9]+)')
@@ -19,6 +19,7 @@ def modify_z_properties(input_file, output_file, l=0.05, S=0.75, distance_to_pau
         dist_10k = 0.0
         total_dist = 0.0
         dist_info = 0.0
+        total_shift = 0.0
 
         with open(input_file, 'r', encoding='utf-8') as f_in, \
                 open(output_file, 'w', encoding='utf-8') as f_out:
@@ -64,9 +65,11 @@ def modify_z_properties(input_file, output_file, l=0.05, S=0.75, distance_to_pau
                 if dist_1k >= distance_to_zoffset:
                     f_out.write(Z_OFFSET_GCODE + "\n")
                     dist_1k -= distance_to_zoffset
+                    total_shift += l
 
                 if dist_10k >= distance_to_pause:
-                    f_out.write("G1 Z10\n" + PAUSE_GCODE + f"G1 Z{curr_z}" + "\n")
+                    f_out.write("G1 Z10\n" + f"SET_GCODE_OFFSET Z_ADJUST=+{total_shift} \n" + PAUSE_GCODE + f"G1 Z{curr_z}" + "\n")
+                    total_shift = 0
                     dist_10k -= distance_to_pause
 
                 if dist_info >= distance_to_info:

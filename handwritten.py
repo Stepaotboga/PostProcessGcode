@@ -1,11 +1,10 @@
 import math
 import re
+import os
 
 
 num_perlins_noises = 2 #количество ступеней шума перлина
 
-import math
-import re
 
 
 # Быстрая и независимая реализация шума Перлина (без сторонних библиотек)
@@ -162,20 +161,49 @@ def apply_perlin_noise_to_segmented_gcode(input_file, output_file, config):
             outfile.write(stripped + "\n")
 
 
-
 def process_noise(input_file, output_file, config):
+    # Временные файлы для промежуточных этапов
+    # 1. Получаем имя файла без расширения (например, из "C:/gcode/part.gcode" сделает "C:/gcode/part")
+    base_dir, _ = os.path.splitext(input_file)
+
+    # 2. Создаем папку, если она еще не существует (exist_ok=True защитит от ошибок, если папка уже есть)
+    os.makedirs(base_dir, exist_ok=True)
+
+    # 3. Извлекаем чистое имя файла с расширением для генерации имен внутри папки
+    pure_filename = os.path.basename(input_file)
+    filename_no_ext, _ = os.path.splitext(pure_filename)
+
+    # 4. Формируем пути к временным файлам внутри созданной папки
+    segments_tmp = os.path.join(
+        base_dir, f"{filename_no_ext}_segments.gcode"
+    )
+    normal_tmp = os.path.join(base_dir, f"{filename_no_ext}_normal.gcode")
+    faded_tmp = os.path.join(base_dir, f"{filename_no_ext}_faded.gcode")
+    noise_tmp = os.path.join(
+        base_dir, f"{filename_no_ext}_noise_applied.gcode"
+    )
+
     # 1. Дробим отрезки
-    segment_splitting(input_file, input_file + "_segments.gcode", config)
+    segment_splitting(input_file, segments_tmp, config)
+    print("segment_splitting done")
 
     # 2. Считаем плавный разгон fade
-    calculate_fade_normal(input_file + "_segments.gcode", input_file + "_normal.gcode", config)
+    calculate_fade_normal(segments_tmp, normal_tmp, config)
+    print("calculate_fade_normal done")
 
     # 3. Считаем плавное затухание fade с конца траекторий
-    calculate_fade_reverse(input_file + "_normal.gcode", input_file + "_faded.gcode", config)
+    calculate_fade_reverse(normal_tmp, faded_tmp, config)
+    print("calculate_fade_reverse done")
 
     # 4. Накладываем шум Перлина на базе полученных fade коэффициентов
-    apply_perlin_noise_to_segmented_gcode(input_file + "_faded.gcode", output_file, config)
-    print("Шум Перлина успешно наложен!")
+    apply_perlin_noise_to_segmented_gcode(faded_tmp, noise_tmp, config)
+    print("perlin_noise done")
+
+    # 5. Очищаем траекторию от слишком малых перемещений (последний обработчик)
+    remove_small_movements(noise_tmp, output_file, min_distance=0.2)
+    print(
+        f"Шум наложен! Промежуточные файлы сохранены в папку: {base_dir}"
+    )
 
 
 def calculate_fade_normal(input_file, output_file, config):
@@ -429,9 +457,9 @@ def segment_splitting(input_file, output_file, config):
                 num_steps = max(1, math.ceil(len_v1 / step_size))
 
                 # Рассчитываем базовое приращение на микро-шаг
-                sub_dx = v1[0] / num_steps
-                sub_dy = v1[1] / num_steps
-                sub_dz = v1[2] / num_steps
+                sub_dx = v1[0] / num_steps * smooth_modifier
+                sub_dy = v1[1] / num_steps * smooth_modifier
+                sub_dz = v1[2] / num_steps * smooth_modifier
 
                 for step in range(1, num_steps + 1):
                     # Если мы дошли до конечной точки сегмента (вершины угла дорезки),
@@ -486,3 +514,109 @@ def segment_splitting(input_file, output_file, config):
     with open(output_file, "w", encoding="utf-8") as outfile:
         for out_line in out_lines:
             outfile.write(out_line + "\n")
+
+
+def remove_small_movements(input_file, output_file, min_distance=0.2):
+    """
+    Удаляет слишком малые перемещения G1 (меньше min_distance мм).
+    Интерполирует (накапливает) перемещения по трем осям XYZ.
+    Команды G0 всегда сбрасывают накопление и записываются как есть.
+    """
+    x_re = re.compile(r"X\s*([0-9.-]+)", re.IGNORECASE)
+    y_re = re.compile(r"Y\s*([0-9.-]+)", re.IGNORECASE)
+    z_re = re.compile(r"Z\s*([0-9.-]+)", re.IGNORECASE)
+
+    # Текущая физическая позиция инструмента (последняя записанная в файл)
+    curr_x, curr_y, curr_z = 0.0, 0.0, 0.0
+
+    # Целевая позиция (куда должен прийти инструмент с учетом пропущенных точек)
+    target_x, target_y, target_z = 0.0, 0.0, 0.0
+
+    # Флаг, определяющий, были ли вообще инициализированы координаты в коде
+    has_coords = False
+
+    with open(input_file, "r", encoding="utf-8") as infile, open(
+            output_file, "w", encoding="utf-8"
+    ) as outfile:
+
+        for line in infile:
+            stripped = line.strip()
+
+            if stripped.startswith("G1"):
+                x_match = x_re.search(stripped)
+                y_match = y_re.search(stripped)
+                z_match = z_re.search(stripped)
+
+                # Если это первая команда или осей не было, инициализируем их текущими значениями
+                if not has_coords:
+                    curr_x = float(x_match.group(1)) if x_match else 0.0
+                    curr_y = float(y_match.group(1)) if y_match else 0.0
+                    curr_z = float(z_match.group(1)) if z_match else 0.0
+                    target_x, target_y, target_z = curr_x, curr_y, curr_z
+                    has_coords = True
+                    outfile.write(stripped + "\n")
+                    continue
+
+                # Обновляем потенциальную целевую точку
+                if x_match: target_x = float(x_match.group(1))
+                if y_match: target_y = float(y_match.group(1))
+                if z_match: target_z = float(z_match.group(1))
+
+                # Вычисляем расстояние в 3D пространстве от ПОСЛЕДНЕЙ ЗАПИСАННОЙ точки
+                dx = target_x - curr_x
+                dy = target_y - curr_y
+                dz = target_z - curr_z
+                distance = math.hypot(dx, dy, dz)
+
+                if distance >= min_distance:
+                    # Формируем новую строку с актуальными интерполированными координатами
+                    new_line = stripped
+
+                    # Перезаписываем или добавляем координаты в G1 кадр
+                    if x_match:
+                        new_line = re.sub(r"X\s*[0-9.-]+", f"X{round(target_x, 3)}", new_line, flags=re.IGNORECASE)
+                    else:
+                        new_line = re.sub(r"G1", f"G1 X{round(target_x, 3)}", new_line, flags=re.IGNORECASE)
+
+                    if y_match:
+                        new_line = re.sub(r"Y\s*[0-9.-]+", f"Y{round(target_y, 3)}", new_line, flags=re.IGNORECASE)
+                    else:
+                        new_line = re.sub(r"(X\s*[0-9.-]+)", r"\1" + f" Y{round(target_y, 3)}", new_line,
+                                          flags=re.IGNORECASE)
+
+                    if z_match:
+                        new_line = re.sub(r"Z\s*[0-9.-]+", f"Z{round(target_z, 3)}", new_line, flags=re.IGNORECASE)
+                    elif 'Z' in stripped or dz != 0:
+                        # Если Z была в исходной строке или изменилась, добавляем в конец перед комментариями
+                        if ";" in new_line:
+                            new_line = re.sub(r";", f"Z{round(target_z, 3)} ;", new_line, count=1)
+                        else:
+                            new_line += f" Z{round(target_z, 3)}"
+
+                    outfile.write(new_line + "\n")
+
+                    # Смещаем текущую записанную позицию
+                    curr_x, curr_y, curr_z = target_x, target_y, target_z
+                else:
+                    # Пропускаем строку (дистанция слишком мала), координаты аккумулируются в target_*
+                    continue
+
+            elif stripped.startswith("G0"):
+                # При холостом ходе G0 принудительно записываем накопленный шаг (если он был)
+                if has_coords and (curr_x != target_x or curr_y != target_y or curr_z != target_z):
+                    # Восстанавливаем последнюю отброшенную точку перед G0, чтобы не потерять геометрию
+                    outfile.write(f"G1 X{round(target_x, 3)} Y{round(target_y, 3)} Z{round(target_z, 3)}\n")
+
+                x_match = x_re.search(stripped)
+                y_match = y_re.search(stripped)
+                z_match = z_re.search(stripped)
+
+                if x_match: curr_x = target_x = float(x_match.group(1))
+                if y_match: curr_y = target_y = float(y_match.group(1))
+                if z_match: curr_z = target_z = float(z_match.group(1))
+                has_coords = True
+
+                outfile.write(stripped + "\n")
+            else:
+                # Все остальные команды (M3, M5, комментарии и т.д.) пишем без изменений
+                outfile.write(stripped + "\n")
