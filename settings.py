@@ -1,7 +1,11 @@
 import json
 import os
+import sys
 
-SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "settings.json")
+
+BASE_DIR = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) \
+    else os.path.dirname(os.path.abspath(__file__))
+SETTINGS_FILE = os.path.join(BASE_DIR, "settings.json")
 
 # Шум почерка (бывший DEFAULT_CONST, без параметров смещения)
 NOISE_CONST = {
